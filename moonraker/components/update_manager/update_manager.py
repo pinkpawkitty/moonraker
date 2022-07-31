@@ -83,15 +83,6 @@ class UpdateManager:
             self.updaters['system'] = PackageDeploy(config, self.cmd_helper)
         mcfg = self.app_config["moonraker"]
         kcfg = self.app_config["klipper"]
-        mclass = get_deploy_class(mcfg.get("path"))
-        self.updaters['moonraker'] = mclass(mcfg, self.cmd_helper)
-        kclass = BaseDeploy
-        if (
-            os.path.exists(kcfg.get("path")) and
-            os.path.exists(kcfg.get("env"))
-        ):
-            kclass = get_deploy_class(kcfg.get("path"))
-        self.updaters['klipper'] = kclass(kcfg, self.cmd_helper)
 
         # TODO: The below check may be removed when invalid config options
         # raise a config error.
@@ -107,6 +98,14 @@ class UpdateManager:
         for section in client_sections:
             cfg = config[section]
             name = section.split()[-1]
+            if name in ['moonraker', 'klipper']:
+                if name == 'moonraker':
+                    editcfg = mcfg
+                else:
+                    editcfg = kcfg
+                for (key, value) in cfg.get_options().items():
+                    editcfg.set_option(key, value)
+                continue
             if name in self.updaters:
                 self.server.add_warning(
                     f"[update_manager]: Extension {name} already added"
@@ -127,6 +126,16 @@ class UpdateManager:
                 self.server.add_warning(
                     f"[update_manager]: Failed to load extension {name}: {e}"
                 )
+
+        mclass = get_deploy_class(mcfg.get("path"))
+        self.updaters['moonraker'] = mclass(mcfg, self.cmd_helper)
+        kclass = BaseDeploy
+        if (
+            os.path.exists(kcfg.get("path")) and
+            os.path.exists(kcfg.get("env"))
+        ):
+            kclass = get_deploy_class(kcfg.get("path"))
+        self.updaters['klipper'] = kclass(kcfg, self.cmd_helper)
 
         self.cmd_request_lock = asyncio.Lock()
         self.initial_refresh_complete: bool = False
