@@ -103,8 +103,8 @@ class UpdateManager:
                     editcfg = mcfg
                 else:
                     editcfg = kcfg
-                for (key, value) in cfg.get_options().items():
-                    editcfg.set_option(key, value)
+                for key in cfg.get_options():
+                    editcfg.set_option(key, cfg.get(key))
                 continue
             if name in self.updaters:
                 self.server.add_warning(
