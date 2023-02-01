@@ -60,6 +60,9 @@ klippy_uds_address: /tmp/klippy_uds
 #   Default is /tmp/klippy_uds.
 max_upload_size: 1024
 #   The maximum size allowed for a file upload (in MiB).  Default is 1024 MiB.
+max_websocket_connections:
+#   The maximum number of concurrently open websocket connections.
+#   The default is 50.
 enable_debug_logging: False
 #   ***DEPRECATED***
 #   Verbose logging is enabled by the '-v' command line option.
@@ -332,11 +335,18 @@ authorization module.
 # moonraker.conf
 
 [authorization]
+enable_api_key: True
+#   Enables API Key authentication.  The default is True.
 login_timeout:
 #   The time, in days, after which a user is forced to re-enter their
 #   credentials to log in.  This period begins when a logged out user
 #   first logs in.  Successive logins without logging out will not
 #   renew the timeout.  The default is 90 days.
+max_login_attempts:
+#   Maximum number of consecutive failed login attempts before an IP address
+#   is locked out.  Failed logins are tracked per IP and are reset upon a
+#   successful login.  Locked out IPs are reset when Moonraker restarts.
+#   By default there is no maximum number of logins.
 trusted_clients:
  192.168.1.30
  192.168.1.0/24
@@ -1928,18 +1938,18 @@ separate from `moonraker.conf`.  This allows users to safely distribute
 their configuration and log files without revealing credentials and
 other sensitive information.
 
-!!! Note:
-    This section no long has configuration options.  Previously the
+!!! Note
+    This section no longer has configuration options.  Previously the
     `secrets_path` option was used to specify the location of the file.
     The secrets file name and location is now determined by the `data path`
-    and `alias` command line options, ie: `<data_base_path>/<alias>.secrets`.
-    By default this resolves to `$HOME/moonraker_data/moonraker.secrets`.
-    This may be a symbolic link.
+    and `alias` command line options, ie: `<data_base_path>/moonraker.secrets`.
+    For a typical single instance installation this resolves to
+    `$HOME/printer_data/moonraker.secrets`. This may be a symbolic link.
 
 Example ini secrets file:
 
 ```ini
-# moonraker_secrets.ini
+# /home/pi/printer_data/moonraker.secrets
 
 [mqtt_credentials]
 username: mqtt_user
