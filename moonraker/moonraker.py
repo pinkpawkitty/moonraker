@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     FlexCallback = Callable[..., Optional[Coroutine]]
     _T = TypeVar("_T")
 
-API_VERSION = (1, 1, 0)
+API_VERSION = (1, 2, 1)
 CORE_COMPONENTS = [
     'dbus_manager', 'database', 'file_manager', 'klippy_apis',
     'machine', 'data_store', 'shell_command', 'proc_stats',
@@ -57,6 +57,7 @@ SENTINEL = SentinelClass.get_instance()
 
 class Server:
     error = ServerError
+    config_error = confighelper.ConfigError
     def __init__(self,
                  args: Dict[str, Any],
                  log_manager: LogManager,
@@ -69,6 +70,7 @@ class Server:
         self.components: Dict[str, Any] = {}
         self.failed_components: List[str] = []
         self.warnings: Dict[str, str] = {}
+        self._is_configured: bool = False
 
         self.config = config = self._parse_config()
         self.host: str = config.get('host', "0.0.0.0")
@@ -123,6 +125,9 @@ class Server:
 
     def is_running(self) -> bool:
         return self.server_running
+
+    def is_configured(self) -> bool:
+        return self._is_configured
 
     def is_debug_enabled(self) -> bool:
         return self.debug
@@ -238,6 +243,7 @@ class Server:
 
         self.klippy_connection.configure(config)
         config.validate_config()
+        self._is_configured = True
 
     def load_component(self,
                        config: confighelper.ConfigHelper,
@@ -259,7 +265,7 @@ class Server:
             if component_name not in self.failed_components:
                 self.failed_components.append(component_name)
             if isinstance(default, SentinelClass):
-                raise ServerError(msg)
+                raise
             return default
         self.components[component_name] = component
         logging.info(f"Component ({component_name}) loaded")

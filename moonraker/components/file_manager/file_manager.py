@@ -31,6 +31,7 @@ from typing import (
     List,
     Set,
     Coroutine,
+    Awaitable,
     Callable,
     TypeVar,
     cast,
@@ -77,10 +78,10 @@ class FileManager:
             "systemd", self.datapath.joinpath("systemd"), False
         )
         self.gcode_metadata = MetadataStorage(config, db)
-        self.inotify_handler = INotifyHandler(config, self,
-                                              self.gcode_metadata)
-        self.write_mutex = asyncio.Lock()
-        self.notify_sync_lock: Optional[NotifySyncLock] = None
+        self.sync_lock = NotifySyncLock(config)
+        self.inotify_handler = INotifyHandler(
+            config, self, self.gcode_metadata, self.sync_lock
+        )
         self.fixed_path_args: Dict[str, Any] = {}
         self.queue_gcodes: bool = config.getboolean('queue_gcode_uploads',
                                                     False)
@@ -176,9 +177,14 @@ class FileManager:
         cfg_file: Optional[str] = paths.get("config_file")
         cfg_parent = self.file_paths.get("config")
         if cfg_file is not None and cfg_parent is not None:
-            cfg_path = pathlib.Path(cfg_file).resolve()
-            par_path = pathlib.Path(cfg_parent).resolve()
-            if par_path not in cfg_path.parents:
+            cfg_path = pathlib.Path(cfg_file).expanduser()
+            par_path = pathlib.Path(cfg_parent)
+            if (
+                par_path in cfg_path.parents or
+                par_path.resolve() in cfg_path.resolve().parents
+            ):
+                self.server.remove_warning("klipper_config")
+            else:
                 self.server.add_warning(
                     "file_manager: Klipper configuration file not located in "
                     "'config' folder.\n\n"
@@ -186,8 +192,6 @@ class FileManager:
                     f"Config Folder: {par_path}",
                     warn_id="klipper_config"
                 )
-            else:
-                self.server.remove_warning("klipper_config")
 
     def validate_gcode_path(self, gc_path: str) -> None:
         gc_dir = pathlib.Path(gc_path).expanduser()
@@ -342,12 +346,6 @@ class FileManager:
     def upload_queue_enabled(self) -> bool:
         return self.queue_gcodes
 
-    def sync_inotify_event(self, path: str) -> Optional[NotifySyncLock]:
-        if self.notify_sync_lock is None or \
-                not self.notify_sync_lock.check_need_sync(path):
-            return None
-        return self.notify_sync_lock
-
     async def _handle_filelist_request(self,
                                        web_request: WebRequest
                                        ) -> List[Dict[str, Any]]:
@@ -410,13 +408,16 @@ class FileManager:
             # Get list of files and subdirectories for this target
             dir_info = self._list_directory(dir_path, root, is_extended)
             return dir_info
-        async with self.write_mutex:
+        async with self.sync_lock:
             self.check_reserved_path(dir_path, True)
+            rel_dir = self.get_relative_path(root, dir_path)
             result = {
-                'item': {'path': directory, 'root': root},
-                'action': "create_dir"}
+                'item': {'path': rel_dir, 'root': root},
+                'action': "create_dir"
+            }
             if action == 'POST' and root in self.full_access_roots:
                 # Create a new directory
+                self.sync_lock.setup("create_dir", dir_path)
                 try:
                     os.mkdir(dir_path)
                 except Exception as e:
@@ -430,21 +431,17 @@ class FileManager:
                 if not os.path.isdir(dir_path):
                     raise self.server.error(
                         f"Directory does not exist ({directory})")
+                self.sync_lock.setup("delete_dir", dir_path)
                 force = web_request.get_boolean('force', False)
                 if force:
                     # Make sure that the directory does not contain a file
                     # loaded by the virtual_sdcard
                     self._handle_operation_check(dir_path)
-                    self.notify_sync_lock = NotifySyncLock(dir_path)
                     try:
                         await self.event_loop.run_in_thread(
                             shutil.rmtree, dir_path)
                     except Exception:
-                        self.notify_sync_lock.cancel()
-                        self.notify_sync_lock = None
                         raise
-                    await self.notify_sync_lock.wait(30.)
-                    self.notify_sync_lock = None
                 else:
                     try:
                         os.rmdir(dir_path)
@@ -506,7 +503,7 @@ class FileManager:
                 f"Destination path is read-only: {dest_root}")
         self.check_reserved_path(source_path, False)
         self.check_reserved_path(dest_path, True)
-        async with self.write_mutex:
+        async with self.sync_lock:
             result: Dict[str, Any] = {'item': {'root': dest_root}}
             if not os.path.exists(source_path):
                 raise self.server.error(f"File {source_path} does not exist")
@@ -521,7 +518,7 @@ class FileManager:
                 self._handle_operation_check(source_path)
                 op_func: Callable[..., str] = shutil.move
                 result['source_item'] = {
-                    'path': source,
+                    'path': self.get_relative_path(source_root, source_path),
                     'root': source_root
                 }
                 result['action'] = "move_dir" if os.path.isdir(source_path) \
@@ -532,25 +529,28 @@ class FileManager:
                     op_func = shutil.copytree
                 else:
                     result['action'] = "create_file"
+                    source_base = os.path.basename(source_path)
+                    if (
+                        os.path.isfile(dest_path) or
+                        os.path.isfile(os.path.join(dest_path, source_base))
+                    ):
+                        result['action'] = "modify_file"
                     op_func = shutil.copy2
-            self.notify_sync_lock = NotifySyncLock(dest_path)
+            self.sync_lock.setup(result["action"], dest_path, move_copy=True)
             try:
                 full_dest = await self.event_loop.run_in_thread(
                     op_func, source_path, dest_path)
+                if dest_root == "gcodes":
+                    await self.sync_lock.wait_inotify_event(full_dest)
             except Exception as e:
-                self.notify_sync_lock.cancel()
-                self.notify_sync_lock = None
-                raise self.server.error(str(e))
-            self.notify_sync_lock.update_dest(full_dest)
-            await self.notify_sync_lock.wait(600.)
-            self.notify_sync_lock = None
+                raise self.server.error(str(e)) from e
         result['item']['path'] = self.get_relative_path(dest_root, full_dest)
         return result
 
     async def _handle_zip_files(
         self, web_request: WebRequest
     ) -> Dict[str, Any]:
-        async with self.write_mutex:
+        async with self.sync_lock:
             store_only = web_request.get_boolean("store_only", False)
             suffix = time.strftime("%Y%m%d-%H%M%S", time.localtime())
             dest: str = web_request.get_str(
@@ -582,9 +582,11 @@ class FileManager:
                 raise self.server.error(
                     "At least one file or directory must be specified"
                 )
+            self.sync_lock.setup("create_file", dest_path)
             await self.event_loop.run_in_thread(
                 self._zip_files, items, dest_path, store_only
             )
+
         rel_dest = dest_path.relative_to(self.file_paths[dest_root])
         return {
             "destination": {"root": dest_root, "path": str(rel_dest)},
@@ -719,10 +721,11 @@ class FileManager:
                               form_args: Dict[str, Any]
                               ) -> Dict[str, Any]:
         # lookup root file path
-        async with self.write_mutex:
+        async with self.sync_lock:
             try:
                 upload_info = self._parse_upload_args(form_args)
                 self.check_reserved_path(upload_info["dest_path"], True)
+                self.sync_lock.setup("create_file", upload_info["dest_path"])
                 root = upload_info['root']
                 if root not in self.full_access_roots:
                     raise self.server.error(f"Invalid root request: {root}")
@@ -784,9 +787,9 @@ class FileManager:
             'ext': f_ext
         }
 
-    async def _finish_gcode_upload(self,
-                                   upload_info: Dict[str, Any]
-                                   ) -> Dict[str, Any]:
+    async def _finish_gcode_upload(
+        self, upload_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
         # Verify that the operation can be done if attempting to upload a gcode
         can_start: bool = False
         try:
@@ -796,7 +799,6 @@ class FileManager:
             if e.status_code == 403:
                 raise self.server.error(
                     "File is loaded, upload not permitted", 403)
-        self.notify_sync_lock = NotifySyncLock(upload_info['dest_path'])
         finfo = await self._process_uploaded_file(upload_info)
         await self.gcode_metadata.parse_metadata(
             upload_info['filename'], finfo).wait()
@@ -817,9 +819,6 @@ class FileManager:
                 await job_queue.queue_job(
                     upload_info['filename'], check_exists=False)
                 queued = True
-
-        await self.notify_sync_lock.wait(300.)
-        self.notify_sync_lock = None
         return {
             'item': {
                 'path': upload_info['filename'],
@@ -830,13 +829,10 @@ class FileManager:
             'action': "create_file"
         }
 
-    async def _finish_standard_upload(self,
-                                      upload_info: Dict[str, Any]
-                                      ) -> Dict[str, Any]:
-        self.notify_sync_lock = NotifySyncLock(upload_info['dest_path'])
+    async def _finish_standard_upload(
+        self, upload_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
         await self._process_uploaded_file(upload_info)
-        await self.notify_sync_lock.wait(5.)
-        self.notify_sync_lock = None
         return {
             'item': {
                 'path': upload_info['filename'],
@@ -973,7 +969,7 @@ class FileManager:
         return await self.delete_file(file_path)
 
     async def delete_file(self, path: str) -> Dict[str, Any]:
-        async with self.write_mutex:
+        async with self.sync_lock:
             root, full_path = self._convert_request_path(path)
             self.check_reserved_path(full_path, True)
             filename = self.get_relative_path(root, full_path)
@@ -987,6 +983,7 @@ class FileManager:
             except self.server.error as e:
                 if e.status_code == 403:
                     raise
+            self.sync_lock.setup("delete_file", full_path)
             os.remove(full_path)
         return {
             'item': {'path': filename, 'root': root},
@@ -994,6 +991,156 @@ class FileManager:
 
     def close(self) -> None:
         self.inotify_handler.close()
+
+
+class NotifySyncLock(asyncio.Lock):
+    def __init__(self, config: ConfigHelper) -> None:
+        super().__init__()
+        self.server = config.get_server()
+        self.action: str = ""
+        self.dest_path: Optional[pathlib.Path] = None
+        self.check_pending = False
+        self.move_copy_fut: Optional[asyncio.Future] = None
+        self.sync_waiters: List[asyncio.Future] = []
+        self.pending_paths: Set[pathlib.Path] = set()
+        self.acquired_paths: Set[pathlib.Path] = set()
+
+    def setup(
+        self, action: str, path: StrOrPath, move_copy: bool = False
+    ) -> None:
+        if not self.locked():
+            raise self.server.error(
+                "Cannot call setup unless the lock has been acquired"
+            )
+        # Called by a file manager request.  Sets the destination path to sync
+        # with the inotify handler.
+        if self.dest_path is not None:
+            logging.debug(
+                "NotifySync Error: Setup requested while a path is still pending"
+            )
+            self.finish()
+        if isinstance(path, str):
+            path = pathlib.Path(path)
+        self.dest_path = path
+        self.action = action
+        self.check_pending = move_copy
+
+    async def wait_inotify_event(self, current_path: StrOrPath) -> None:
+        # Called by a file manager move copy request to wait for metadata
+        # analysis to complete.  We need to be careful here to avoid a deadlock
+        # or a long wait time when inotify isn't available.
+        if not self.check_pending:
+            return
+        if isinstance(current_path, str):
+            current_path = pathlib.Path(current_path)
+        self.dest_path = current_path
+        if current_path in self.acquired_paths:
+            # Notifcation has been recieved, no need to wait
+            return
+        self.move_copy_fut = self.server.get_event_loop().create_future()
+        mcfut = self.move_copy_fut
+        has_pending = current_path in self.pending_paths
+        timeout = 1200. if has_pending else 1.
+        for _ in range(5):
+            try:
+                await asyncio.wait_for(asyncio.shield(mcfut), timeout)
+            except asyncio.TimeoutError:
+                if timeout > 2.:
+                    break
+                has_pending = current_path in self.pending_paths
+                timeout = 1200. if has_pending else 1.
+            else:
+                break
+        else:
+            logging.info(
+                f"Failed to receive an inotify event, dest path: {current_path}"
+            )
+        self.move_copy_fut = None
+
+    def finish(self) -> None:
+        # Called by a file manager request upon completion.  The inotify handler
+        # can now emit the websocket notification
+        for waiter in self.sync_waiters:
+            if not waiter.done():
+                waiter.set_result((self.action, self.dest_path))
+        self.sync_waiters.clear()
+        self.dest_path = None
+        self.action = ""
+        self.pending_paths.clear()
+        self.acquired_paths.clear()
+        if self.move_copy_fut is not None and not self.move_copy_fut.done():
+            self.move_copy_fut.set_exception(
+                self.server.error("Move/Copy Interrupted by call to finish")
+            )
+        self.move_copy_fut = None
+        self.check_pending = False
+
+    def add_pending_path(self, action: str, pending_path: StrOrPath) -> None:
+        # Called by the inotify handler whenever a create or move event
+        # is detected.  This is only necessary to track for move/copy actions,
+        # since we don't get the final destination until the request is complete.
+        if (
+            not self.check_pending or
+            self.dest_path is None or
+            action != self.action
+        ):
+            return
+        if isinstance(pending_path, str):
+            pending_path = pathlib.Path(pending_path)
+        if self.dest_path in [pending_path, pending_path.parent]:
+            self.pending_paths.add(pending_path)
+
+    def check_in_request(
+        self, action: str, inotify_path: StrOrPath
+    ) -> Optional[asyncio.Future]:
+        # Called by the inotify handler to check if request synchronization
+        # is necessary.  If so, this method will return a future the inotify
+        # handler can await.
+        if self.dest_path is None:
+            return None
+        if isinstance(inotify_path, str):
+            inotify_path = pathlib.Path(inotify_path)
+        waiter: Optional[asyncio.Future] = None
+        if self.check_pending:
+            # The final path of move/copy requests aren't known until the request
+            # complete.  It may be the destination path recieved from the request
+            # or it may be a child as of that path.
+            if self.move_copy_fut is not None:
+                # Request is complete, metadata analysis pending.  We can explicitly
+                # check for a path match
+                if self.dest_path == inotify_path:
+                    if not self.move_copy_fut.done():
+                        self.move_copy_fut.set_result(None)
+                    waiter = self.server.get_event_loop().create_future()
+            elif self.dest_path in [inotify_path, inotify_path.parent]:
+                # Request is still processing.  This might be the notification for
+                # the request, it will be checked when the move/copy request awaits
+                self.acquired_paths.add(inotify_path)
+                waiter = self.server.get_event_loop().create_future()
+        elif self.dest_path == inotify_path:
+            waiter = self.server.get_event_loop().create_future()
+        if waiter is not None:
+            self._check_action(action, inotify_path)
+            self.sync_waiters.append(waiter)
+        return waiter
+
+    def _check_action(self, action: str, path: StrOrPath) -> bool:
+        # We aren't going to set a hard filter on the sync action, however
+        # we will log mismatches as they shouldn't occur
+        if action != self.action:
+            logging.info(
+                f"\nInotify action mismatch:\n"
+                f"Expected action: {self.action}, Inotify action: {action}\n"
+                f"Requested path: {self.dest_path}\n"
+                f"Inotify path: {path}\n"
+                f"Is move/copy: {self.check_pending}"
+            )
+            return False
+        return True
+
+    def release(self) -> None:
+        super().release()
+        self.finish()
 
 
 INOTIFY_BUNDLE_TIME = .25
@@ -1014,6 +1161,7 @@ class InotifyNode:
         self.pending_node_events: Dict[str, asyncio.Handle] = {}
         self.pending_deleted_children: Set[Tuple[str, bool]] = set()
         self.pending_file_events: Dict[str, str] = {}
+        self.queued_move_notificatons: List[List[str]] = []
         self.is_processing_metadata = False
 
     async def _finish_create_node(self) -> None:
@@ -1036,6 +1184,9 @@ class InotifyNode:
         self.ihdlr.log_nodes()
         self.ihdlr.notify_filelist_changed(
             "create_dir", root, node_path)
+        for args in self.queued_move_notificatons:
+            self.ihdlr.notify_filelist_changed(*args)
+        self.queued_move_notificatons.clear()
 
     def _finish_delete_child(self) -> None:
         # Items deleted in a child (node or file) are batched.
@@ -1079,11 +1230,12 @@ class InotifyNode:
                 metadata_events.append(mevt)
         return metadata_events
 
-    async def move_child_node(self,
-                              child_name: str,
-                              new_name: str,
-                              new_parent: InotifyNode
-                              ) -> None:
+    def move_child_node(
+        self,
+        child_name: str,
+        new_name: str,
+        new_parent: InotifyNode
+    ) -> None:
         self.flush_delete()
         child_node = self.pop_child_node(child_name)
         if child_node is None:
@@ -1097,17 +1249,25 @@ class InotifyNode:
         new_root = child_node.get_root()
         logging.debug(f"Moving node from '{prev_path}' to '{new_path}'")
         # Attempt to move metadata
-        move_success = await self.ihdlr.try_move_metadata(
-            prev_root, new_root, prev_path, new_path, is_dir=True)
-        if not move_success:
-            # Need rescan
-            mevts = child_node.scan_node()
-            if mevts:
-                mfuts = [e.wait() for e in mevts]
-                await asyncio.gather(*mfuts)
-        self.ihdlr.notify_filelist_changed(
-            "move_dir", new_root, new_path,
-            prev_root, prev_path)
+        move_res = self.ihdlr.try_move_metadata(
+            prev_root, new_root, prev_path, new_path, is_dir=True
+        )
+        if new_root == "gcodes":
+            async def _notify_move_dir():
+                if move_res is False:
+                    # Need rescan
+                    mevts = child_node.scan_node()
+                    if mevts:
+                        mfuts = [e.wait() for e in mevts]
+                        await asyncio.gather(*mfuts)
+                self.ihdlr.notify_filelist_changed(
+                    "move_dir", new_root, new_path, prev_root, prev_path
+                )
+            self.ihdlr.queue_gcode_notificaton(_notify_move_dir())
+        else:
+            self.ihdlr.notify_filelist_changed(
+                "move_dir", new_root, new_path, prev_root, prev_path
+            )
 
     def schedule_file_event(self, file_name: str, evt_name: str) -> None:
         if file_name in self.pending_file_events:
@@ -1117,7 +1277,7 @@ class InotifyNode:
             pending_node.stop_event("create_node")
         self.pending_file_events[file_name] = evt_name
 
-    async def complete_file_write(self, file_name: str) -> None:
+    def complete_file_write(self, file_name: str) -> None:
         self.flush_delete()
         evt_name = self.pending_file_events.pop(file_name, None)
         if evt_name is None:
@@ -1136,12 +1296,16 @@ class InotifyNode:
         file_path = os.path.join(self.get_path(), file_name)
         root = self.get_root()
         if root == "gcodes":
-            mevt = self.ihdlr.parse_gcode_metadata(file_path)
-            if os.path.splitext(file_path)[1].lower() == ".ufp":
-                # don't notify .ufp files
-                return
-            await mevt.wait()
-        self.ihdlr.notify_filelist_changed(evt_name, root, file_path)
+            async def _notify_file_write():
+                mevt = self.ihdlr.parse_gcode_metadata(file_path)
+                if os.path.splitext(file_path)[1].lower() == ".ufp":
+                    # don't notify .ufp files
+                    return
+                await mevt.wait()
+                self.ihdlr.notify_filelist_changed(evt_name, root, file_path)
+            self.ihdlr.queue_gcode_notificaton(_notify_file_write())
+        else:
+            self.ihdlr.notify_filelist_changed(evt_name, root, file_path)
 
     def add_child_node(self, node: InotifyNode) -> None:
         self.child_nodes[node.name] = node
@@ -1252,6 +1416,29 @@ class InotifyNode:
             return self
         return self.parent_node.search_pending_event(name)
 
+    def find_pending_node(self) -> Optional[InotifyNode]:
+        if (
+            self.is_processing_metadata or
+            "create_node" in self.pending_node_events
+        ):
+            return self
+        return self.parent_node.find_pending_node()
+
+    def queue_move_notification(self, args: List[str]) -> None:
+        if (
+            self.is_processing_metadata or
+            "create_node" in self.pending_node_events
+        ):
+            self.queued_move_notificatons.append(args)
+        else:
+            if self.ihdlr.server.is_verbose_enabled():
+                path = self.get_path()
+                logging.debug(
+                    f"Node {path} received a move notification queue request, "
+                    f"however node is not pending: {args}"
+                )
+            self.ihdlr.notify_filelist_changed(*args)
+
 class InotifyRootNode(InotifyNode):
     def __init__(self,
                  ihdlr: INotifyHandler,
@@ -1275,89 +1462,39 @@ class InotifyRootNode(InotifyNode):
     def is_processing(self) -> bool:
         return self.is_processing_metadata
 
-class NotifySyncLock:
-    def __init__(self, dest_path: str) -> None:
-        self.wait_fut: Optional[asyncio.Future] = None
-        self.sync_event = asyncio.Event()
-        self.dest_path = dest_path
-        self.notified_paths: Set[str] = set()
-        self.finished: bool = False
-
-    def update_dest(self, dest_path: str) -> None:
-        self.dest_path = dest_path
-
-    def check_need_sync(self, path: str) -> bool:
-        return self.dest_path in [path, os.path.dirname(path)] \
-            and not self.finished
-
-    async def wait(self, timeout: Optional[float] = None) -> None:
-        if self.finished or self.wait_fut is not None:
-            # Can only wait once
-            return
-        if self.dest_path not in self.notified_paths:
-            self.wait_fut = asyncio.Future()
-            if timeout is None:
-                await self.wait_fut
-            else:
-                try:
-                    await asyncio.wait_for(self.wait_fut, timeout)
-                except asyncio.TimeoutError:
-                    pass
-        self.sync_event.set()
-        self.finished = True
-
-    async def sync(self, path, timeout: Optional[float] = None) -> None:
-        if not self.check_need_sync(path):
-            return
-        self.notified_paths.add(path)
+    def find_pending_node(self) -> Optional[InotifyNode]:
         if (
-            self.wait_fut is not None and
-            not self.wait_fut.done() and
-            self.dest_path == path
+            self.is_processing_metadata or
+            "create_node" in self.pending_node_events
         ):
-            self.wait_fut.set_result(None)
-        # Transfer control to waiter
-        try:
-            await asyncio.wait_for(self.sync_event.wait(), timeout)
-        except Exception:
-            pass
-        else:
-            # Sleep an additional 5ms to give HTTP requests a chance to
-            # return prior to a notification
-            await asyncio.sleep(.005)
-
-    def cancel(self) -> None:
-        if self.finished:
-            return
-        if self.wait_fut is not None and not self.wait_fut.done():
-            self.wait_fut.set_result(None)
-        self.sync_event.set()
-        self.finished = True
+            return self
+        return None
 
 class INotifyHandler:
-    def __init__(self,
-                 config: ConfigHelper,
-                 file_manager: FileManager,
-                 gcode_metadata: MetadataStorage
-                 ) -> None:
+    def __init__(
+        self,
+        config: ConfigHelper,
+        file_manager: FileManager,
+        gcode_metadata: MetadataStorage,
+        sync_lock: NotifySyncLock
+    ) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
         self.enable_warn = config.getboolean("enable_inotify_warnings", True)
         self.file_manager = file_manager
         self.gcode_metadata = gcode_metadata
+        self.sync_lock = sync_lock
         self.inotify = INotify(nonblocking=True)
         self.event_loop.add_reader(
             self.inotify.fileno(), self._handle_inotify_read)
-
-        self.node_loop_busy: bool = False
-        self.pending_inotify_events: List[InotifyEvent] = []
-
         self.watched_roots: Dict[str, InotifyRootNode] = {}
         self.watched_nodes: Dict[int, InotifyNode] = {}
         self.pending_moves: Dict[
             int, Tuple[InotifyNode, str, asyncio.Handle]] = {}
         self.create_gcode_notifications: Dict[str, Any] = {}
         self.initialized: bool = False
+        self.pending_gcode_notifications: List[Coroutine] = []
+        self._gc_notify_task: Optional[asyncio.Task] = None
 
     def add_root_watch(self, root: str, root_path: str) -> None:
         # remove all exisiting watches on root
@@ -1455,26 +1592,25 @@ class INotifyHandler:
             else:
                 self.gcode_metadata.remove_file_metadata(rel_path)
 
-    async def try_move_metadata(self,
-                                prev_root: str,
-                                new_root: str,
-                                prev_path: str,
-                                new_path: str,
-                                is_dir: bool = False
-                                ) -> bool:
+    def try_move_metadata(
+        self,
+        prev_root: str,
+        new_root: str,
+        prev_path: str,
+        new_path: str,
+        is_dir: bool = False
+    ) -> Union[bool, Awaitable]:
         if new_root == "gcodes":
             if prev_root == "gcodes":
                 # moved within the gcodes root, move metadata
-                prev_rel_path = self.file_manager.get_relative_path(
-                    "gcodes", prev_path)
-                new_rel_path = self.file_manager.get_relative_path(
-                    "gcodes", new_path)
+                fm = self.file_manager
+                gcm = self.gcode_metadata
+                prev_rel_path = fm.get_relative_path("gcodes", prev_path)
+                new_rel_path = fm.get_relative_path("gcodes", new_path)
                 if is_dir:
-                    await self.gcode_metadata.move_directory_metadata(
-                        prev_rel_path, new_rel_path)
+                    gcm.move_directory_metadata(prev_rel_path, new_rel_path)
                 else:
-                    return await self.gcode_metadata.move_file_metadata(
-                        prev_rel_path, new_rel_path)
+                    return gcm.move_file_metadata(prev_rel_path, new_rel_path)
             else:
                 # move from a non-gcodes root to gcodes root needs a rescan
                 self.clear_metadata(prev_root, prev_path, is_dir)
@@ -1554,31 +1690,21 @@ class INotifyHandler:
                     f"not currently tracked: name: {evt.name}, "
                     f"flags: {flags}")
                 continue
-            self.pending_inotify_events.append(evt)
-            if not self.node_loop_busy:
-                self.node_loop_busy = True
-                self.event_loop.register_callback(self._process_inotify_events)
-
-    async def _process_inotify_events(self) -> None:
-        while self.pending_inotify_events:
-            evt = self.pending_inotify_events.pop(0)
             node = self.watched_nodes[evt.wd]
             if evt.mask & iFlags.ISDIR:
-                await self._process_dir_event(evt, node)
+                self._process_dir_event(evt, node)
             else:
-                await self._process_file_event(evt, node)
-        self.node_loop_busy = False
+                self._process_file_event(evt, node)
 
-    async def _process_dir_event(self,
-                                 evt: InotifyEvent,
-                                 node: InotifyNode
-                                 ) -> None:
+    def _process_dir_event(self, evt: InotifyEvent, node: InotifyNode) -> None:
         if evt.name in ['.', ".."]:
             # ignore events for self and parent
             return
         root = node.get_root()
         node_path = node.get_path()
+        full_path = os.path.join(node_path, evt.name)
         if evt.mask & iFlags.CREATE:
+            self.sync_lock.add_pending_path("create_dir", full_path)
             logging.debug(f"Inotify directory create: {root}, "
                           f"{node_path}, {evt.name}")
             node.create_child_node(evt.name)
@@ -1595,20 +1721,19 @@ class INotifyHandler:
                           f"{node_path}, {evt.name}")
             moved_evt = self.pending_moves.pop(evt.cookie, None)
             if moved_evt is not None:
+                self.sync_lock.add_pending_path("move_dir", full_path)
                 # Moved from a currently watched directory
                 prev_parent, child_name, hdl = moved_evt
                 hdl.cancel()
-                await prev_parent.move_child_node(child_name, evt.name, node)
+                prev_parent.move_child_node(child_name, evt.name, node)
             else:
                 # Moved from an unwatched directory, for our
                 # purposes this is the same as creating a
                 # directory
+                self.sync_lock.add_pending_path("create_dir", full_path)
                 node.create_child_node(evt.name)
 
-    async def _process_file_event(self,
-                                  evt: InotifyEvent,
-                                  node: InotifyNode
-                                  ) -> None:
+    def _process_file_event(self, evt: InotifyEvent, node: InotifyNode) -> None:
         ext: str = os.path.splitext(evt.name)[-1].lower()
         root = node.get_root()
         node_path = node.get_path()
@@ -1616,10 +1741,11 @@ class INotifyHandler:
         if evt.mask & iFlags.CREATE:
             logging.debug(f"Inotify file create: {root}, "
                           f"{node_path}, {evt.name}")
+            self.sync_lock.add_pending_path("create_file", file_path)
             node.schedule_file_event(evt.name, "create_file")
             if os.path.islink(file_path):
                 logging.debug(f"Inotify symlink create: {file_path}")
-                await node.complete_file_write(evt.name)
+                node.complete_file_write(evt.name)
         elif evt.mask & iFlags.DELETE:
             logging.debug(f"Inotify file delete: {root}, "
                           f"{node_path}, {evt.name}")
@@ -1636,40 +1762,89 @@ class INotifyHandler:
                           f"{node_path}, {evt.name}")
             node.flush_delete()
             moved_evt = self.pending_moves.pop(evt.cookie, None)
-            # Don't emit file events if the node is processing metadata
-            can_notify = not node.is_processing()
+            pending_node = node.find_pending_node()
             if moved_evt is not None:
                 # Moved from a currently watched directory
+                self.sync_lock.add_pending_path("move_file", file_path)
                 prev_parent, prev_name, hdl = moved_evt
                 hdl.cancel()
                 prev_root = prev_parent.get_root()
                 prev_path = os.path.join(prev_parent.get_path(), prev_name)
-                move_success = await self.try_move_metadata(
-                    prev_root, root, prev_path, file_path)
-                if not move_success:
-                    # Unable to move, metadata needs parsing
-                    mevt = self.parse_gcode_metadata(file_path)
-                    await mevt.wait()
-                if can_notify:
-                    self.notify_filelist_changed(
-                        "move_file", root, file_path,
-                        prev_root, prev_path)
-            else:
+                move_res = self.try_move_metadata(prev_root, root, prev_path, file_path)
                 if root == "gcodes":
-                    mevt = self.parse_gcode_metadata(file_path)
-                    await mevt.wait()
-                if can_notify:
-                    self.notify_filelist_changed(
-                        "create_file", root, file_path)
-            if not can_notify:
-                logging.debug("Metadata is processing, suppressing move "
-                              f"notification: {file_path}")
+                    coro = self._finish_gcode_move(
+                        root, prev_root, file_path, prev_path, pending_node, move_res
+                    )
+                    self.queue_gcode_notificaton(coro)
+                else:
+                    args = ["move_file", root, file_path, prev_root, prev_path]
+                    if pending_node is None:
+                        self.notify_filelist_changed(*args)
+                    else:
+                        pending_node.queue_move_notification(args)
+            else:
+                self.sync_lock.add_pending_path("create_file", file_path)
+                if root == "gcodes":
+                    coro = self._finish_gcode_create_from_move(file_path, pending_node)
+                    self.queue_gcode_notificaton(coro)
+                else:
+                    args = ["create_file", root, file_path]
+                    if pending_node is None:
+                        self.notify_filelist_changed(*args)
+                    else:
+                        pending_node.queue_move_notification(args)
         elif evt.mask & iFlags.MODIFY:
+            self.sync_lock.add_pending_path("modify_file", file_path)
             node.schedule_file_event(evt.name, "modify_file")
         elif evt.mask & iFlags.CLOSE_WRITE:
             logging.debug(f"Inotify writable file closed: {file_path}")
             # Only process files that have been created or modified
-            await node.complete_file_write(evt.name)
+            node.complete_file_write(evt.name)
+
+    async def _finish_gcode_move(
+        self,
+        root: str,
+        prev_root: str,
+        file_path: str,
+        prev_path: str,
+        pending_node: Optional[InotifyNode],
+        move_result: Union[bool, Awaitable]
+    ) -> None:
+        if not isinstance(move_result, bool):
+            await move_result
+        elif not move_result:
+            # Unable to move, metadata needs parsing
+            mevt = self.parse_gcode_metadata(file_path)
+            await mevt.wait()
+        args = ["move_file", root, file_path, prev_root, prev_path]
+        if pending_node is None:
+            self.notify_filelist_changed(*args)
+        else:
+            pending_node.queue_move_notification(args)
+
+    async def _finish_gcode_create_from_move(
+        self, file_path: str, pending_node: Optional[InotifyNode]
+    ) -> None:
+        mevt = self.parse_gcode_metadata(file_path)
+        await mevt.wait()
+        args = ["create_file", "gcodes", file_path]
+        if pending_node is None:
+            self.notify_filelist_changed(*args)
+        else:
+            pending_node.queue_move_notification(args)
+
+    def queue_gcode_notificaton(self, coro: Coroutine) -> None:
+        self.pending_gcode_notifications.append(coro)
+        if self._gc_notify_task is None:
+            self._gc_notify_task = self.event_loop.create_task(
+                self._process_gcode_notifications()
+            )
+
+    async def _process_gcode_notifications(self) -> None:
+        while self.pending_gcode_notifications:
+            coro = self.pending_gcode_notifications.pop(0)
+            await coro
+        self._gc_notify_task = None
 
     def notify_filelist_changed(self,
                                 action: str,
@@ -1679,18 +1854,25 @@ class INotifyHandler:
                                 source_path: Optional[str] = None
                                 ) -> None:
         rel_path = self.file_manager.get_relative_path(root, full_path)
+        sync_fut = self.sync_lock.check_in_request(action, full_path)
         file_info: Dict[str, Any] = {'size': 0, 'modified': 0}
-        is_valid = True
         if os.path.exists(full_path):
             try:
                 file_info = self.file_manager.get_path_info(full_path, root)
             except Exception:
-                is_valid = False
+                logging.debug(
+                    f"Invalid Filelist Notification Request, root: {root}, "
+                    f"path: {full_path} - Failed to get path info")
+                return
         elif action not in ["delete_file", "delete_dir"]:
-            is_valid = False
+            logging.debug(
+                f"Invalid Filelist Notification Request, root: {root}, "
+                f"path: {full_path} - Action {action} received for file "
+                "that does not exit"
+            )
+            return
         ext = os.path.splitext(rel_path)[-1].lower()
         if (
-            is_valid and
             root == "gcodes" and
             ext in VALID_GCODE_EXTS and
             action == "create_file"
@@ -1699,9 +1881,8 @@ class INotifyHandler:
             if file_info == prev_info:
                 logging.debug("Ignoring duplicate 'create_file' "
                               f"notification: {rel_path}")
-                is_valid = False
-            else:
-                self.create_gcode_notifications[rel_path] = dict(file_info)
+                return
+            self.create_gcode_notifications[rel_path] = dict(file_info)
         elif rel_path in self.create_gcode_notifications:
             del self.create_gcode_notifications[rel_path]
         file_info['path'] = rel_path
@@ -1711,26 +1892,28 @@ class INotifyHandler:
             src_rel_path = self.file_manager.get_relative_path(
                 source_root, source_path)
             result['source_item'] = {'path': src_rel_path, 'root': source_root}
-        sync_lock = self.file_manager.sync_inotify_event(full_path)
-        if sync_lock is not None:
+        if sync_fut is not None:
             # Delay this notification so that it occurs after an item
             logging.debug(f"Syncing notification: {full_path}")
             self.event_loop.register_callback(
-                self._sync_with_request, result,
-                sync_lock.sync(full_path), is_valid)
-        elif is_valid:
+                self._sync_with_request, result, sync_fut
+            )
+        else:
             self.server.send_event("file_manager:filelist_changed", result)
 
-    async def _sync_with_request(self,
-                                 result: Dict[str, Any],
-                                 sync_fut: Coroutine,
-                                 is_valid: bool
-                                 ) -> None:
+    async def _sync_with_request(
+        self, result: Dict[str, Any], sync_fut: asyncio.Future
+    ) -> None:
         await sync_fut
-        if is_valid:
-            self.server.send_event("file_manager:filelist_changed", result)
+        await asyncio.sleep(.005)
+        self.server.send_event("file_manager:filelist_changed", result)
 
     def close(self) -> None:
+        while self.pending_gcode_notifications:
+            coro = self.pending_gcode_notifications.pop(0)
+            coro.close()
+        if self._gc_notify_task is not None:
+            self._gc_notify_task.cancel()
         self.event_loop.remove_reader(self.inotify.fileno())
         for watch in self.watched_nodes.keys():
             try:
@@ -1818,6 +2001,9 @@ class MetadataStorage:
         self.metadata[key] = val
         self.mddb[key] = val
 
+    def is_processing(self) -> bool:
+        return len(self.pending_requests) > 0
+
     def _has_valid_data(self,
                         fname: str,
                         path_info: Dict[str, Any]
@@ -1874,10 +2060,7 @@ class MetadataStorage:
                     except Exception:
                         logging.debug(f"Error removing thumb at {thumb_path}")
 
-    async def move_directory_metadata(self,
-                                      prev_dir: str,
-                                      new_dir: str
-                                      ) -> None:
+    def move_directory_metadata(self, prev_dir: str, new_dir: str) -> None:
         if prev_dir[-1] != "/":
             prev_dir += "/"
         moved: List[Tuple[str, str, Dict[str, Any]]] = []
@@ -1894,14 +2077,12 @@ class MetadataStorage:
             source = [m[0] for m in moved]
             dest = [m[1] for m in moved]
             self.mddb.move_batch(source, dest)
-            eventloop = self.server.get_event_loop()
-            await eventloop.run_in_thread(self._move_thumbnails, moved)
+            # It shouldn't be necessary to move the thumbnails
+            # as they would be moved with the parent directory
 
-    async def move_file_metadata(self,
-                                 prev_fname: str,
-                                 new_fname: str,
-                                 move_thumbs: bool = True
-                                 ) -> bool:
+    def move_file_metadata(
+        self, prev_fname: str, new_fname: str
+    ) -> Union[bool, Awaitable]:
         metadata: Optional[Dict[str, Any]]
         metadata = self.metadata.pop(prev_fname, None)
         if metadata is None:
@@ -1911,18 +2092,15 @@ class MetadataStorage:
             if self.metadata.pop(new_fname, None) is not None:
                 self.mddb.pop(new_fname, None)
             return False
+
         self.metadata[new_fname] = metadata
         self.mddb.move_batch([prev_fname], [new_fname])
-        if move_thumbs:
-            eventloop = self.server.get_event_loop()
-            await eventloop.run_in_thread(
-                self._move_thumbnails,
-                [(prev_fname, new_fname, metadata)])
-        return True
+        return self._move_thumbnails([(prev_fname, new_fname, metadata)])
 
-    def _move_thumbnails(self,
-                         records: List[Tuple[str, str, Dict[str, Any]]]
-                         ) -> None:
+    async def _move_thumbnails(
+        self, records: List[Tuple[str, str, Dict[str, Any]]]
+    ) -> None:
+        eventloop = self.server.get_event_loop()
         for (prev_fname, new_fname, metadata) in records:
             prev_dir = os.path.dirname(os.path.join(self.gc_path, prev_fname))
             new_dir = os.path.dirname(os.path.join(self.gc_path, new_fname))
@@ -1936,12 +2114,21 @@ class MetadataStorage:
                     if not os.path.isfile(thumb_path):
                         continue
                     new_path = os.path.join(new_dir, path)
+                    new_parent = os.path.dirname(new_path)
                     try:
-                        os.makedirs(os.path.dirname(new_path), exist_ok=True)
-                        shutil.move(thumb_path, new_path)
+                        if not os.path.exists(new_parent):
+                            os.mkdir(new_parent)
+                            # Wait for inotify to register the node before the move
+                            await asyncio.sleep(.2)
+                        await eventloop.run_in_thread(
+                            shutil.move, thumb_path, new_path
+                        )
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:
-                        logging.debug(f"Error moving thumb from {thumb_path}"
-                                      f" to {new_path}")
+                        logging.exception(
+                            f"Error moving thumb from {thumb_path} to {new_path}"
+                        )
 
     def parse_metadata(self,
                        fname: str,
