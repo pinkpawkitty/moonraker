@@ -13,6 +13,7 @@ import re
 import time
 import zipfile
 from .app_deploy import AppDeploy
+from .common import Channel
 from ...utils import verify_source
 
 # Annotation imports
@@ -36,8 +37,11 @@ RINFO_KEYS = [
 
 class ZipDeploy(AppDeploy):
     def __init__(self, config: ConfigHelper, cmd_helper: CommandHelper) -> None:
-        super().__init__(config, cmd_helper)
-        self.need_channel_update = self.type != "zip"
+        super().__init__(config, cmd_helper, "Zip Dist")
+        self._configure_path(config)
+        self._configure_virtualenv(config)
+        self._configure_dependencies(config, node_only=True)
+        self.origin: str = config.get('origin')
         self.official_repo: str = "?"
         self.owner: str = "?"
         # Extract repo from origin for validation
@@ -54,12 +58,6 @@ class ZipDeploy(AppDeploy):
         self.package_list: List[str] = []
         self.python_pkg_list: List[str] = []
         self.release_download_info: Tuple[str, str, int] = ("?", "?", 0)
-
-    @staticmethod
-    async def from_application(app: AppDeploy) -> ZipDeploy:
-        new_app = ZipDeploy(app.config, app.cmd_helper)
-        await new_app.reinstall()
-        return new_app
 
     async def initialize(self) -> Dict[str, Any]:
         storage = await super().initialize()
@@ -134,10 +132,6 @@ class ZipDeploy(AppDeploy):
         for key in RINFO_KEYS:
             if key not in release_info:
                 self._add_error(f"Missing release info item: {key}")
-        if 'channel' in release_info:
-            local_channel = release_info['channel']
-            if self.channel == "stable" and local_channel == "beta":
-                self.need_channel_update = True
         self.full_version = release_info.get('long_version', "?")
         self.short_version = self._get_tag_version(
             release_info.get('git_version', ""))
@@ -202,7 +196,7 @@ class ZipDeploy(AppDeploy):
         current_release: Dict[str, Any] = {}
         for release in releases:
             if not latest_release:
-                if self.channel != "stable":
+                if self.channel != Channel.STABLE:
                     # Allow the beta channel to update regardless
                     latest_release = release
                 elif not release['prerelease']:
@@ -306,7 +300,6 @@ class ZipDeploy(AppDeploy):
             f" Repo: {self.official_repo}\n"
             f" Path: {self.path}\n"
             f" Pristine: {self.pristine}\n"
-            f" Need Channel Update: {self.need_channel_update}\n"
             f" Commits Behind: {len(self.commit_log)}\n"
             f"Current Release Info:\n"
             f" Source Checksum: {self.source_checksum}\n"

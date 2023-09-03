@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
 import os
+import asyncio
 import pathlib
 import logging
 import dbus_next
@@ -57,6 +58,8 @@ class DbusManager:
         try:
             self.bus = MessageBus(bus_type=BusType.SYSTEM)
             await self.bus.connect()
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logging.info("Unable to Connect to D-Bus")
             return
@@ -66,20 +69,31 @@ class DbusManager:
                 "org.freedesktop.PolicyKit1",
                 "/org/freedesktop/PolicyKit1/Authority",
                 "org.freedesktop.PolicyKit1.Authority")
-        except self.DbusError:
-            self.server.add_warning(
-                "Unable to find DBus PolKit Interface, this suggests PolKit "
-                "is not installed on your OS.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if self.server.is_debug_enabled():
+                logging.exception("Failed to get PolKit interface")
+            else:
+                logging.info(f"Failed to get PolKit interface: {e}")
+            self.polkit = None
 
     async def check_permission(self,
                                action: str,
                                err_msg: str = ""
                                ) -> bool:
         if self.polkit is None:
+            self.server.add_warning(
+                "Unable to find DBus PolKit Interface, this suggests PolKit "
+                "is not installed on your OS.",
+                "dbus_polkit"
+            )
             return False
         try:
             ret = await self.polkit.call_check_authorization(  # type: ignore
                 self.polkit_subject, action, {}, 0, "")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             self._check_warned()
             self.server.add_warning(

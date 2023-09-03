@@ -15,6 +15,7 @@ import tempfile
 import asyncio
 import zipfile
 import time
+import math
 from copy import deepcopy
 from inotify_simple import INotify
 from inotify_simple import flags as iFlags
@@ -346,10 +347,22 @@ class FileManager:
     def get_metadata_storage(self) -> MetadataStorage:
         return self.gcode_metadata
 
-    def check_file_exists(self, root: str, filename: str) -> bool:
-        root_dir = self.file_paths.get(root, "")
-        file_path = os.path.join(root_dir, filename)
-        return os.path.exists(file_path)
+    def check_file_exists(
+        self,
+        root: str,
+        filename: str,
+        modified: Optional[float] = None
+    ) -> bool:
+        if root not in self.file_paths:
+            return False
+        root_dir = pathlib.Path(self.file_paths[root])
+        file_path = root_dir.joinpath(filename)
+        if file_path.is_file():
+            if modified is None:
+                return True
+            fstat = file_path.stat()
+            return math.isclose(fstat.st_mtime, modified)
+        return False
 
     def can_access_path(self, path: StrOrPath) -> bool:
         if isinstance(path, str):
@@ -2455,9 +2468,11 @@ class MetadataStorage:
         if self.enable_object_proc:
             timeout = 300.
             cmd += " --check-objects"
-        shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
-        scmd = shell_cmd.build_shell_command(cmd, log_stderr=True)
-        result = await scmd.run_with_response(timeout=timeout)
+        result = bytearray()
+        sc: SCMDComp = self.server.lookup_component('shell_command')
+        scmd = sc.build_shell_command(cmd, callback=result.extend, log_stderr=True)
+        if not await scmd.run(timeout=timeout):
+            raise self.server.error("Extract Metadata returned with error")
         try:
             decoded_resp: Dict[str, Any] = json.loads(result.strip())
         except Exception:

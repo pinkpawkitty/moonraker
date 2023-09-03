@@ -313,7 +313,7 @@ JSON-RPC request:
 {
     "jsonrpc": "2.0",
     "method": "server.config",
-    "id": 5616,
+    "id": 5616
 }
 ```
 Returns:
@@ -487,16 +487,28 @@ included.
 #### Request Cached Temperature Data
 HTTP request:
 ```http
-GET /server/temperature_store
+GET /server/temperature_store?include_monitors=false
 ```
 JSON-RPC request:
 ```json
 {
     "jsonrpc": "2.0",
     "method": "server.temperature_store",
+    "params": {
+        "include_monitors": false
+    },
     "id": 2313
 }
 ```
+
+Parameters:
+
+- `include_monitors`: _Optional, defaults to `false`._  When set to `true`
+  the response will include sensors reported as `temperature monitors` by
+  Klipper.  A temperature monitor may report `null` values in the `temperatures`
+  field, applications should be sure that they are modified to handle this
+  condition before setting `inlcude_monitors` to `true`.
+
 Returns:
 
 An object where the keys are the available temperature sensor names, and with
@@ -923,8 +935,8 @@ An object where the top level items are "eventtime" and "status".  The
     }
 }
 ```
-See [printer_objects.md](printer_objects.md) for details on the printer objects
-available for query.
+See [Klipper's status reference](https://www.klipper3d.org/Status_Reference.html) for
+details on the printer objects available for query.
 
 #### Subscribe to printer object status
 HTTP request:
@@ -987,8 +999,8 @@ the `/printer/objects/query`:
 }
 ```
 
-See [printer_objects.md](printer_objects.md) for details on the printer objects
-available for subscription.
+See [Klipper's status reference](https://www.klipper3d.org/Status_Reference.html) for
+details on the printer objects available for subscription.
 
 Status updates for subscribed objects are sent asynchronously over the
 websocket.  See the [notify_status_update](#subscriptions)
@@ -3798,7 +3810,7 @@ JSON-RPC request:
 {
     "jsonrpc": "2.0",
     "method": "server.webcams.get_item",
-    "parmams": {
+    "params": {
         "name": "cam_name"
     },
     "id": 4654
@@ -3862,7 +3874,7 @@ JSON-RPC request:
 {
     "jsonrpc": "2.0",
     "method": "server.webcams.post_item",
-    "parmams": {
+    "params": {
         "name": "cam_name",
         "snapshot_url": "/webcam?action=snapshot",
         "stream_url": "/webcam?action=stream"
@@ -3948,7 +3960,7 @@ JSON-RPC request:
 {
     "jsonrpc": "2.0",
     "method": "server.webcams.delete_item",
-    "parmams": {
+    "params": {
         "name": "cam_name"
     },
     "id": 4654
@@ -3997,7 +4009,7 @@ JSON-RPC request:
 {
     "jsonrpc": "2.0",
     "method": "server.webcams.test",
-    "parmams": {
+    "params": {
         "name": "cam_name"
     },
     "id": 4654
@@ -4144,7 +4156,6 @@ and `fluidd` are present as clients configured in `moonraker.conf`
         "moonraker": {
             "channel": "dev",
             "debug_enabled": true,
-            "need_channel_update": false,
             "is_valid": true,
             "configured_type": "git_repo",
             "corrupt": false,
@@ -4156,6 +4167,7 @@ and `fluidd` are present as clients configured in `moonraker.conf`
             "repo_name": "moonraker",
             "version": "v0.7.1-364",
             "remote_version": "v0.7.1-364",
+            "rollback_version": "v0.7.1-360",
             "current_hash": "ecfad5cff15fff1d82cb9bdc64d6b548ed53dfaf",
             "remote_hash": "ecfad5cff15fff1d82cb9bdc64d6b548ed53dfaf",
             "is_dirty": false,
@@ -4163,33 +4175,48 @@ and `fluidd` are present as clients configured in `moonraker.conf`
             "commits_behind": [],
             "git_messages": [],
             "full_version_string": "v0.7.1-364-gecfad5c",
-            "pristine": true
+            "pristine": true,
+            "recovery_url": "https://github.com/Arksine/moonraker.git",
+            "remote_url": "https://github.com/Arksine/moonraker.git",
+            "warnings": [],
+            "anomalies": [
+                "Unofficial remote url: https://github.com/Arksine/moonraker-fork.git",
+                "Repo not on offical remote/branch, expected: origin/master, detected: altremote/altbranch",
+                "Detached HEAD detected"
+            ]
         },
         "mainsail": {
             "name": "mainsail",
             "owner": "mainsail-crew",
             "version": "v2.1.1",
             "remote_version": "v2.1.1",
+            "rollback_version": "v2.0.0",
             "configured_type": "web",
             "channel": "stable",
             "info_tags": [
                 "desc=Mainsail Web Client",
                 "action=some_action"
-            ]
+            ],
+            "warnings": [],
+            "anomalies": [],
+            "is_valid": true
         },
         "fluidd": {
             "name": "fluidd",
-            "owner": "cadriel",
-            "version": "?",
+            "owner": "fluidd-core",
+            "version": "v1.16.2",
             "remote_version": "v1.16.2",
-            "configured_type": "web_beta",
+            "rollback_version": "v1.15.0",
+            "configured_type": "web",
             "channel": "beta",
-            "info_tags": []
+            "info_tags": [],
+            "warnings": [],
+            "anomalies": [],
+            "is_valid": true
         },
         "klipper": {
             "channel": "dev",
             "debug_enabled": true,
-            "need_channel_update": false,
             "is_valid": true,
             "configured_type": "git_repo",
             "corrupt": false,
@@ -4201,6 +4228,7 @@ and `fluidd` are present as clients configured in `moonraker.conf`
             "repo_name": "klipper",
             "version": "v0.10.0-1",
             "remote_version": "v0.10.0-41",
+            "rollback_version": "v0.9.1-340",
             "current_hash": "4c8d24ae03eadf3fc5a28efb1209ce810251d02d",
             "remote_hash": "e3cbe7ea3663a8cd10207a9aecc4e5458aeb1f1f",
             "is_dirty": false,
@@ -4225,7 +4253,11 @@ and `fluidd` are present as clients configured in `moonraker.conf`
             ],
             "git_messages": [],
             "full_version_string": "v0.10.0-1-g4c8d24ae-shallow",
-            "pristine": true
+            "pristine": true,
+            "recovery_url": "https://github.com/Klipper3d/klipper.git",
+            "remote_url": "https://github.com/Klipper3d/klipper.git",
+            "warnings": [],
+            "anomalies": [],
         }
     }
 }
@@ -4242,23 +4274,18 @@ Below is an explanation for each field:
 - `github_limit_reset_time`:  the time when the rate limit will reset,
   reported as seconds since the epoch (aka Unix Time).
 
-The `moonraker`, `klipper` packages, along with and clients configured
-as applications have the following fields:
+Extensions configured with the `git_repo` type will contain the following
+fields:
 
 - `configured_type`: the application type configured by the user
 - `detected_type`:  the application type as detected by Moonraker.
 - `channel`:  the currently configured update channel.  For Moonraker
   and Klipper this is set in the `[update_manager]` configuration.
   For clients the channel is determined by the configured type
-- `need_channel_update`: This will be set to `true` if Moonraker has
-  detected that a channel swap is necessary (ie: the configured type does
-  not match the detected type). The channel swap will be performed on the
-  next update.
-- `pristine`: For `zip` and `zip_beta` types this is set to `true` if an
-  applications source checksum matches the one generated  when the app was
-  built.  This value will be set to the opposite of "dirty" for git repos.
-  Note that a zip application can still be updated if the repo is not
-  pristine.
+- `pristine`: Indicates that there are no modified files or untracked
+  source files in a `git_repo`.  A repo with untracked files can still
+  be updated, however a repo with modified files (ie: `dirty`) cannot
+  be updated.
 - `owner`: the owner of the repo / application
 - `branch`: the name of the current git branch.  This should typically
     be "master".
@@ -4266,26 +4293,22 @@ as applications have the following fields:
     "origin".
 - `version`:  abbreviated version of the current repo on disk
 - `remote_version`: abbreviated version of the latest available update
+- `rollback_version`: version the repo will revert to when a rollback is
+   requested
 - `full_version_string`:  The complete version string of the current repo.
 - `current_hash`: hash of the most recent commit on disk
 - `remote_hash`: hash of the most recent commit pushed to the remote
-- `is_valid`: true if installation is a valid git repo on the master branch
-    and an "origin" set to the official remote.  For `zip` and `zip_beta`
-    types this will report false if Moonraker is unable to fetch the
-    current repo state from GitHub.
+- `is_valid`: true if the `git_repo` is valid and can be updated.
 - `corrupt`: Indicates that the git repo has been corrupted.  When a repo
   is in this state it a hard recovery (ie: re-cloning the repo) is necessary.
   Note that the most common cause of repo corruption is removing power from
   the host machine without safely shutting down.  Damaged storage can also
   lead to repo corruption.
-- `is_dirty`: true if the repo has been modified.  This will always be false
-  for `zip` and `zip_beta` types.
-- `detached`: true if the repo is currently in a detached state.  For `zip`
-  and `zip_beta` types it is considered detached if the local release info
-  does not match what is present on the remote.
-- `debug_enabled`: True when `enable_repo_debug` has been configured.  This
-    will bypass repo validation allowing detached updates, and updates from
-    a remote/branch other than than the primary (typically origin/master).
+- `is_dirty`: true if a `git_repo` has modified files.  A dirty repo cannot
+  be updated.
+- `detached`: true if the `git_repo` is currently in a detached state.
+- `debug_enabled`: True when debug flag has been set via the command line.
+  When debug is enabled Moonraker will allow detached updates.
 - `commits_behind`: A list of commits behind.  Up to 30 "untagged" commits
   will be reported.  Moonraker checks the last 100 commits for tags, any
   commits beyond the last 30 with a tag will also be reported.
@@ -4299,21 +4322,48 @@ as applications have the following fields:
   configuration for each client. Client developers my define what tags,
   if any, users will configure.  They can choose to use those tags to display
   information or perform an additional action after an update if necessary.
+- `recovery_url`:  The url Moonraker will use to re-clone the repo when a
+  hard recovery is requested.  If this reports a "?" then a hard recovery is
+  not possible.
+- `remote_url`:  The url for the currently configured remote.
+- `warnings`:  An array of strings that describe warnings detected during
+  repo init.  These warnings provide additional context when the `is_valid`
+  field reports `true`.
+- `anomalies`:  An array of strings that describe anomalies found during
+  initialization.  An anomaly can be defined as an unexpected condition, they
+  will not result in an invalid state, nor will they prevent an update.  For
+  example, when the detected remote url does not match the configured/expected
+  url Moonraker will fall back to the detected url and report this condition
+  as an anomaly.
 
-Web clients have the following fields:
+Extensions configured with the `web` type will contain the following fields:
 
 - `channel`: channel to fetch updates from
-- `configured_type`: will be `web` or `web_beta`
+- `configured_type`: will be `web`
 - `name`: name of the configured client
 - `owner`: the owner of the client
 - `version`:  version of the installed client.
 - `remote_version`:  version of the latest release published to GitHub
+- `rollback_version`: version the client will revert to when a rollback is
+   requested
 - `info_tags`: These are tags defined in the `[update_manager client_name]`
   configuration for each client. Client developers my define what tags,
   if any, users will configure.  They can choose to use those tags to display
   information or perform an additional action after an update if necessary.
+- `is_valid`: A boolean that reports true if an update is possible, false
+  if an update cannot be performed.
+- `warnings`:  An array of strings that describe warnings detected during
+  updater init.  These warnings add context when the `is_valid` field reports
+  `true`.
+- `anomalies`:  An array of strings that describe anomalies found during
+  initialization.  An anomaly can be defined as an unexpected condition, they
+  will not result in an invalid state, nor will they prevent an update.
+  For example, when the configured repo to check for updates does not match
+  the detected repo Moonraker will fall back to the detected repo and report
+  this condition as an anomaly.
 
-The `system` package has the following fields:
+
+The `system` object contains the following fields:
 
 - `package_count`: the number of system packages available for update
 - `package_list`: an array containing the names of packages available
@@ -4516,6 +4566,31 @@ JSON-RPC request:
     "id": 4564
 }
 ```
+Returns:
+
+`ok` when complete
+
+### Rollback to the previous version
+
+HTTP request:
+
+```http
+POST /machine/update/rollback?name=moonraker
+```
+
+JSON-RPC request:
+
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "machine.update.rollback",
+    "params": {
+        "name": "moonraker"
+    },
+    "id": 4564
+}
+```
+
 Returns:
 
 `ok` when complete
@@ -5185,6 +5260,127 @@ An object containing all measurements for every configured sensor:
     }
 }
 ```
+
+### Spoolman APIs
+The following APIs are available to interact with the Spoolman integration:
+
+#### Set active spool
+Set the ID of the spool that Moonraker should report usage to Spoolman of.
+
+HTTP request:
+```http
+POST /server/spoolman/spool_id
+Content-Type: application/json
+
+{
+    "spool_id": 1
+}
+```
+JSON-RPC request:
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "server.spoolman.post_spool_id",
+    "params": {
+        "spool_id": 1
+    },
+    "id": 4654
+}
+```
+
+Returns:
+
+The id of the now active spool:
+
+```json
+{
+    "spool_id": 1
+}
+```
+
+!!! note
+    Send an empty object, `{}`, to un-set the spool ID and stop any reporting.
+    The response `spool_id` will then be set to *null*
+
+#### Get active spool
+Retrieve the ID of the spool to which Moonraker reports usage for Spoolman.
+
+HTTP request:
+```http
+GET /server/spoolman/spool_id
+```
+JSON-RPC request:
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "server.spoolman.get_spool_id",
+    "id": 4654
+}
+```
+
+Returns:
+
+The id of the active spool:
+
+```json
+{
+    "spool_id": 1
+}
+```
+
+!!! note
+    The `spool_id` can be *null* if there is no active spool.
+
+#### Proxy
+
+Moonraker supplies a proxy endpoint where you have full access to the Spoolman
+API without having to configure the endpoint yourself.
+
+See Spoolman's [OpenAPI Description](https://donkie.github.io/Spoolman/) for
+detailed information about it's API.
+
+HTTP request:
+```http
+POST /server/spoolman/proxy
+Content-Type: application/json
+
+{
+    "request_method": "POST",
+    "path": "/v1/spool",
+    "query": "a=1&b=4",
+    "body": {
+        "filament_id": 1
+    }
+}
+```
+
+JSON-RPC request:
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "server.spoolman.proxy",
+    "params": {
+        "request_method": "POST",
+        "path": "/v1/spool",
+        "query": "a=1&b=4",
+        "body": {
+            "filament_id": 1
+        }
+    },
+    "id": 4654
+}
+```
+
+The following parameters are available. `request_method` and `path` are required, the rest are optional.
+
+- `request_method`: The HTTP request method, e.g. `GET`, `POST`, `DELETE`, etc.
+- `path`: The endpoint, including API version, e.g. `/v1/filament`.
+- `query`: The query part of the URL, e.g. `filament_material=PLA&vendor_name=Prima`.
+- `body`: The request body for the request.
+
+Returns:
+
+The json response from the Spoolman server.
 
 ### OctoPrint API emulation
 Partial support of OctoPrint API is implemented with the purpose of
@@ -6597,6 +6793,25 @@ webcam is added, removed, or updated.
 
 The `webcams` field contans an array of objects like those returned by the
 [list webcams](#list-webcams) API.
+
+#### Spoolman active spool ID changed
+
+Moonraker will emit the `notify_active_spool_set` event when the active spool
+ID for the Spoolman integration has been changed.
+
+See the [Spoolman API](#spoolman-apis) for more information.
+
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "notify_active_spool_set",
+    "params": [
+        {
+            "spool_id": 1
+        }
+    ]
+}
+```
 
 #### Agent Events
 Moonraker will emit the `notify_agent_event` notification when it

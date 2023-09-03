@@ -17,11 +17,13 @@ import socket
 import logging
 import signal
 import asyncio
+import uuid
+import traceback
 from . import confighelper
 from .eventloop import EventLoop
 from .app import MoonrakerApp
 from .klippy_connection import KlippyConnection
-from .utils import ServerError, Sentinel, get_software_version
+from .utils import ServerError, Sentinel, get_software_info
 from .loghelper import LogManager
 
 # Annotation imports
@@ -46,7 +48,7 @@ if TYPE_CHECKING:
     FlexCallback = Callable[..., Optional[Coroutine]]
     _T = TypeVar("_T", Sentinel, Any)
 
-API_VERSION = (1, 2, 1)
+API_VERSION = (1, 3, 0)
 CORE_COMPONENTS = [
     'dbus_manager', 'database', 'file_manager', 'klippy_apis',
     'machine', 'data_store', 'shell_command', 'proc_stats',
@@ -194,8 +196,9 @@ class Server:
         if connect_to_klippy:
             self.klippy_connection.connect()
 
-    def add_log_rollover_item(self, name: str, item: str,
-                              log: bool = True) -> None:
+    def add_log_rollover_item(
+        self, name: str, item: str, log: bool = True
+    ) -> None:
         self.log_manager.set_rollover_info(name, item)
         if log and item is not None:
             logging.info(item)
@@ -299,17 +302,15 @@ class Server:
                 f"Component '{component_name}' already registered")
         self.components[component_name] = component
 
-    def register_notification(self,
-                              event_name: str,
-                              notify_name: Optional[str] = None
-                              ) -> None:
+    def register_notification(
+        self, event_name: str, notify_name: Optional[str] = None
+    ) -> None:
         wsm: WebsocketManager = self.lookup_component("websockets")
         wsm.register_notification(event_name, notify_name)
 
-    def register_event_handler(self,
-                               event: str,
-                               callback: FlexCallback
-                               ) -> None:
+    def register_event_handler(
+        self, event: str, callback: FlexCallback
+    ) -> None:
         self.events.setdefault(event, []).append(callback)
 
     def send_event(self, event: str, *args) -> asyncio.Future:
@@ -318,29 +319,38 @@ class Server:
             self._process_event, fut, event, *args)
         return fut
 
-    async def _process_event(self,
-                             fut: asyncio.Future,
-                             event: str,
-                             *args
-                             ) -> None:
+    async def _process_event(
+        self, fut: asyncio.Future, event: str, *args
+    ) -> None:
         events = self.events.get(event, [])
         coroutines: List[Coroutine] = []
-        try:
-            for func in events:
+        for func in events:
+            try:
                 ret = func(*args)
+            except Exception:
+                logging.exception(f"Error processing callback in event {event}")
+            else:
                 if ret is not None:
                     coroutines.append(ret)
-            if coroutines:
-                await asyncio.gather(*coroutines)
-        except ServerError as e:
-            logging.exception(f"Error Processing Event: {fut}")
+        if coroutines:
+            results = await asyncio.gather(*coroutines, return_exceptions=True)
+            for val in results:
+                if isinstance(val, Exception):
+                    if sys.version_info < (3, 10):
+                        exc_info = "".join(traceback.format_exception(
+                            type(val), val, val.__traceback__
+                        ))
+                    else:
+                        exc_info = "".join(traceback.format_exception(val))
+                    logging.info(
+                        f"\nError processing callback in event {event}\n{exc_info}"
+                    )
         if not fut.done():
             fut.set_result(None)
 
-    def register_remote_method(self,
-                               method_name: str,
-                               cb: FlexCallback
-                               ) -> None:
+    def register_remote_method(
+        self, method_name: str, cb: FlexCallback
+    ) -> None:
         self.klippy_connection.register_remote_method(method_name, cb)
 
     def get_host_info(self) -> Dict[str, Any]:
@@ -416,9 +426,7 @@ class Server:
         self.event_loop.register_callback(self._stop_server)
         return "ok"
 
-    async def _handle_info_request(self,
-                                   web_request: WebRequest
-                                   ) -> Dict[str, Any]:
+    async def _handle_info_request(self, web_request: WebRequest) -> Dict[str, Any]:
         raw = web_request.get_boolean("raw", False)
         file_manager: Optional[FileManager] = self.lookup_component(
             'file_manager', None)
@@ -447,9 +455,7 @@ class Server:
             'api_version_string': ".".join([str(v) for v in API_VERSION])
         }
 
-    async def _handle_config_request(self,
-                                     web_request: WebRequest
-                                     ) -> Dict[str, Any]:
+    async def _handle_config_request(self, web_request: WebRequest) -> Dict[str, Any]:
         cfg_file_list: List[Dict[str, Any]] = []
         cfg_parent = pathlib.Path(
             self.app_args["config_file"]
@@ -468,33 +474,62 @@ class Server:
         }
 
 def main(from_package: bool = True) -> None:
+    def get_env_bool(key: str) -> bool:
+        return os.getenv(key, "").lower() in ["y", "yes", "true"]
+
     # Parse start arguments
     parser = argparse.ArgumentParser(
         description="Moonraker - Klipper API Server")
     parser.add_argument(
-        "-d", "--datapath", default=None,
+        "-d", "--datapath",
+        default=os.getenv("MOONRAKER_DATA_PATH"),
         metavar='<data path>',
         help="Location of Moonraker Data File Path"
     )
     parser.add_argument(
-        "-c", "--configfile", default=None, metavar='<configfile>',
-        help="Location of moonraker configuration file")
+        "-c", "--configfile",
+        default=os.getenv("MOONRAKER_CONFIG_PATH"),
+        metavar='<configfile>',
+        help="Path to Moonraker's configuration file"
+    )
     parser.add_argument(
-        "-l", "--logfile", default=None, metavar='<logfile>',
-        help="log file name and location")
+        "-l", "--logfile",
+        default=os.getenv("MOONRAKER_LOG_PATH"),
+        metavar='<logfile>',
+        help="Path to Moonraker's log file"
+    )
     parser.add_argument(
-        "-n", "--nologfile", action='store_true',
-        help="disable logging to a file")
+        "-u", "--unixsocket",
+        default=os.getenv("MOONRAKER_UDS_PATH"),
+        metavar="<unixsocket>",
+        help="Path to Moonraker's unix domain socket"
+    )
     parser.add_argument(
-        "-v", "--verbose", action="store_true",
+        "-n", "--nologfile",
+        action='store_const',
+        const=True,
+        default=get_env_bool("MOONRAKER_DISABLE_FILE_LOG"),
+        help="disable logging to a file"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action='store_const',
+        const=True,
+        default=get_env_bool("MOONRAKER_VERBOSE_LOGGING"),
         help="Enable verbose logging"
     )
     parser.add_argument(
-        "-g", "--debug", action="store_true",
+        "-g", "--debug",
+        action='store_const',
+        const=True,
+        default=get_env_bool("MOONRAKER_ENABLE_DEBUG"),
         help="Enable Moonraker debug features"
     )
     parser.add_argument(
-        "-o", "--asyncio-debug", action="store_true",
+        "-o", "--asyncio-debug",
+        action='store_const',
+        const=True,
+        default=get_env_bool("MOONRAKER_ASYNCIO_DEBUG"),
         help="Enable asyncio debug flag"
     )
     cmd_line_args = parser.parse_args()
@@ -509,10 +544,23 @@ def main(from_package: bool = True) -> None:
             startup_warnings.append(
                 f"Unable to create data path folder at {data_path}"
             )
+    uuid_path = data_path.joinpath(".moonraker.uuid")
+    if not uuid_path.is_file():
+        instance_uuid = uuid.uuid4().hex
+        uuid_path.write_text(instance_uuid)
+    else:
+        instance_uuid = uuid_path.read_text().strip()
     if cmd_line_args.configfile is not None:
         cfg_file: str = cmd_line_args.configfile
     else:
         cfg_file = str(data_path.joinpath("config/moonraker.conf"))
+    if cmd_line_args.unixsocket is not None:
+        unix_sock: str = cmd_line_args.unixsocket
+    else:
+        comms_dir = data_path.joinpath("comms")
+        if not comms_dir.exists():
+            comms_dir.mkdir()
+        unix_sock = str(comms_dir.joinpath("moonraker.sock"))
     app_args = {
         "data_path": str(data_path),
         "is_default_data_path": cmd_line_args.datapath is None,
@@ -522,11 +570,13 @@ def main(from_package: bool = True) -> None:
         "debug": cmd_line_args.debug,
         "asyncio_debug": cmd_line_args.asyncio_debug,
         "is_backup_config": False,
-        "is_python_package": from_package
+        "is_python_package": from_package,
+        "instance_uuid": instance_uuid,
+        "unix_socket_path": unix_sock
     }
 
     # Setup Logging
-    version = get_software_version()
+    app_args.update(get_software_info())
     if cmd_line_args.nologfile:
         app_args["log_file"] = ""
     elif cmd_line_args.logfile:
@@ -534,7 +584,6 @@ def main(from_package: bool = True) -> None:
             os.path.expanduser(cmd_line_args.logfile))
     else:
         app_args["log_file"] = str(data_path.joinpath("logs/moonraker.log"))
-    app_args["software_version"] = version
     app_args["python_version"] = sys.version.replace("\n", " ")
     log_manager = LogManager(app_args, startup_warnings)
 
