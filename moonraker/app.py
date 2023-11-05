@@ -8,7 +8,6 @@ from __future__ import annotations
 import os
 import mimetypes
 import logging
-import json
 import traceback
 import ssl
 import pathlib
@@ -17,6 +16,7 @@ import tornado
 import tornado.iostream
 import tornado.httputil
 import tornado.web
+from asyncio import Lock
 from inspect import isclass
 from tornado.escape import url_unescape, url_escape
 from tornado.routing import Rule, PathMatches, AnyMatches
@@ -24,12 +24,13 @@ from tornado.http1connection import HTTP1Connection
 from tornado.log import access_log
 from .common import WebRequest, APIDefinition, APITransport
 from .utils import ServerError, source_info
+from .utils import json_wrapper as jsonw
 from .websockets import (
     WebsocketManager,
     WebSocket,
     BridgeSocket
 )
-from streaming_form_data import StreamingFormDataParser
+from streaming_form_data import StreamingFormDataParser, ParseFailedException
 from streaming_form_data.targets import FileTarget, ValueTarget, SHA256Target
 
 # Annotation imports
@@ -168,6 +169,22 @@ class MoonrakerApp:
         self.key_path: pathlib.Path = self._get_path_option(
             config, 'ssl_key_path')
 
+        # Route Prefix
+        home_pattern = "/"
+        self._route_prefix: str = ""
+        route_prefix = config.get("route_prefix", None)
+        if route_prefix is not None:
+            rparts = route_prefix.strip("/").split("/")
+            rp = "/".join(
+                [url_escape(part, plus=False) for part in rparts if part]
+            )
+            if not rp:
+                raise config.error(
+                    f"Invalid value for option 'route_prefix': {route_prefix}"
+                )
+            self._route_prefix = f"/{rp}"
+            home_pattern = f"{self._route_prefix}/?"
+
         # Set Up Websocket and Authorization Managers
         self.wsm = WebsocketManager(self.server)
         self.internal_transport = InternalTransport(self.server)
@@ -196,10 +213,10 @@ class MoonrakerApp:
         self.mutable_router = MutableRouter(self)
         app_handlers: List[Any] = [
             (AnyMatches(), self.mutable_router),
-            (r"/", WelcomeHandler),
-            (r"/websocket", WebSocket),
-            (r"/klippysocket", BridgeSocket),
-            (r"/server/redirect", RedirectHandler)
+            (home_pattern, WelcomeHandler),
+            (f"{self._route_prefix}/websocket", WebSocket),
+            (f"{self._route_prefix}/klippysocket", BridgeSocket),
+            (f"{self._route_prefix}/server/redirect", RedirectHandler)
         ]
         self.app = tornado.web.Application(app_handlers, **app_args)
         self.get_handler_delegate = self.app.get_handler_delegate
@@ -242,6 +259,15 @@ class MoonrakerApp:
                 f"{path} does not exist"
             )
         return item
+
+    @property
+    def route_prefix(self):
+        return self._route_prefix
+
+    def parse_endpoint(self, http_path: str) -> str:
+        if not self._route_prefix or not http_path.startswith(self._route_prefix):
+            return http_path
+        return http_path[len(self._route_prefix):]
 
     def listen(self, host: str, port: int, ssl_port: int) -> None:
         if host.lower() == "all":
@@ -317,7 +343,8 @@ class MoonrakerApp:
         params['callback'] = api_def.endpoint
         params['need_object_parser'] = api_def.need_object_parser
         self.mutable_router.add_handler(
-            api_def.uri, DynamicRequestHandler, params)
+            f"{self._route_prefix}{api_def.uri}", DynamicRequestHandler, params
+        )
         self.registered_base_handlers.append(api_def.uri)
         for name, transport in self.api_transports.items():
             transport.register_api_handler(api_def)
@@ -345,7 +372,9 @@ class MoonrakerApp:
             params['wrap_result'] = wrap_result
             params['is_remote'] = False
             params['content_type'] = content_type
-            self.mutable_router.add_handler(uri, DynamicRequestHandler, params)
+            self.mutable_router.add_handler(
+                f"{self._route_prefix}{uri}", DynamicRequestHandler, params
+            )
         self.registered_base_handlers.append(uri)
         for name, transport in self.api_transports.items():
             if name in transports:
@@ -367,15 +396,21 @@ class MoonrakerApp:
             return
         logging.debug(f"Registering static file: ({pattern}) {file_path}")
         params = {'path': file_path}
-        self.mutable_router.add_handler(pattern, FileRequestHandler, params)
+        self.mutable_router.add_handler(
+            f"{self._route_prefix}{pattern}", FileRequestHandler, params
+        )
 
     def register_upload_handler(
-        self, pattern: str, location_prefix: Optional[str] = None
+        self, pattern: str, location_prefix: str = "server/files"
     ) -> None:
         params: Dict[str, Any] = {'max_upload_size': self.max_upload_size}
-        if location_prefix is not None:
-            params['location_prefix'] = location_prefix
-        self.mutable_router.add_handler(pattern, FileUploadHandler, params)
+        location_prefix = location_prefix.strip("/")
+        if self._route_prefix:
+            location_prefix = f"{self._route_prefix.strip('/')}/{location_prefix}"
+        params['location_prefix'] = location_prefix
+        self.mutable_router.add_handler(
+            f"{self._route_prefix}{pattern}", FileUploadHandler, params
+        )
 
     def register_debug_handler(
         self,
@@ -461,6 +496,7 @@ class MoonrakerApp:
 class AuthorizedRequestHandler(tornado.web.RequestHandler):
     def initialize(self) -> None:
         self.server: Server = self.settings['server']
+        self.endpoint: str = ""
 
     def set_default_headers(self) -> None:
         origin: Optional[str] = self.request.headers.get("Origin")
@@ -473,9 +509,11 @@ class AuthorizedRequestHandler(tornado.web.RequestHandler):
             self.cors_enabled = auth.check_cors(origin, self)
 
     def prepare(self) -> None:
+        app: MoonrakerApp = self.server.lookup_component("application")
+        self.endpoint = app.parse_endpoint(self.request.path or "")
         auth: AuthComp = self.server.lookup_component('authorization', None)
         if auth is not None:
-            self.current_user = auth.check_authorized(self.request)
+            self.current_user = auth.check_authorized(self.request, self.endpoint)
 
     def options(self, *args, **kwargs) -> None:
         # Enable CORS if configured
@@ -508,7 +546,8 @@ class AuthorizedRequestHandler(tornado.web.RequestHandler):
         if 'exc_info' in kwargs:
             err['traceback'] = "\n".join(
                 traceback.format_exception(*kwargs['exc_info']))
-        self.finish({'error': err})
+        self.set_header("Content-Type", "application/json; charset=UTF-8")
+        self.finish(jsonw.dumps({'error': err}))
 
 # Due to the way Python treats multiple inheritance its best
 # to create a separate authorized handler for serving files
@@ -519,6 +558,7 @@ class AuthorizedFileHandler(tornado.web.StaticFileHandler):
                    ) -> None:
         super(AuthorizedFileHandler, self).initialize(path, default_filename)
         self.server: Server = self.settings['server']
+        self.endpoint: str = ""
 
     def set_default_headers(self) -> None:
         origin: Optional[str] = self.request.headers.get("Origin")
@@ -531,9 +571,11 @@ class AuthorizedFileHandler(tornado.web.StaticFileHandler):
             self.cors_enabled = auth.check_cors(origin, self)
 
     def prepare(self) -> None:
+        app: MoonrakerApp = self.server.lookup_component("application")
+        self.endpoint = app.parse_endpoint(self.request.path or "")
         auth: AuthComp = self.server.lookup_component('authorization', None)
         if auth is not None and self._check_need_auth():
-            self.current_user = auth.check_authorized(self.request)
+            self.current_user = auth.check_authorized(self.request, self.endpoint)
 
     def options(self, *args, **kwargs) -> None:
         # Enable CORS if configured
@@ -548,7 +590,8 @@ class AuthorizedFileHandler(tornado.web.StaticFileHandler):
         if 'exc_info' in kwargs:
             err['traceback'] = "\n".join(
                 traceback.format_exception(*kwargs['exc_info']))
-        self.finish({'error': err})
+        self.set_header("Content-Type", "application/json; charset=UTF-8")
+        self.finish(jsonw.dumps({'error': err}))
 
     def _check_need_auth(self) -> bool:
         if self.request.method != "GET":
@@ -583,7 +626,7 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         type_funcs: Dict[str, Callable] = {
             "int": int, "float": float,
             "bool": lambda x: x.lower() == "true",
-            "json": json.loads}
+            "json": jsonw.loads}
         if hint not in type_funcs:
             logging.info(f"No conversion method for type hint {hint}")
             return value
@@ -632,8 +675,8 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         content_type = self.request.headers.get('Content-Type', "").strip()
         if content_type.startswith("application/json"):
             try:
-                args.update(json.loads(self.request.body))
-            except json.JSONDecodeError:
+                args.update(jsonw.loads(self.request.body))
+            except jsonw.JSONDecodeError:
                 pass
         for key, value in self.path_kwargs.items():
             if value is not None:
@@ -645,8 +688,8 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
             resp = args
             if isinstance(args, dict):
                 if (
-                    self.request.path.startswith("/access") or
-                    self.request.path.startswith("/machine/sudo/password")
+                    self.endpoint.startswith("/access") or
+                    self.endpoint.startswith("/machine/sudo/password")
                 ):
                     resp = {key: "<sanitized>" for key in args}
             elif isinstance(args, str):
@@ -669,7 +712,7 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
                                 ) -> Any:
         assert callable(self.callback)
         return await self.callback(
-            WebRequest(self.request.path, args, self.request.method,
+            WebRequest(self.endpoint, args, self.request.method,
                        conn=conn, ip_addr=self.request.remote_ip or "",
                        user=self.current_user))
 
@@ -698,11 +741,14 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
                 e.status_code, reason=str(e)) from e
         if self.wrap_result:
             result = {'result': result}
-        elif self.content_type is not None:
-            self.set_header("Content-Type", self.content_type)
+        self._log_debug(f"HTTP Response::{req}", result)
         if result is None:
             self.set_status(204)
-        self._log_debug(f"HTTP Response::{req}", result)
+        elif isinstance(result, dict):
+            self.set_header("Content-Type", "application/json; charset=UTF-8")
+            result = jsonw.dumps(result)
+        elif self.content_type is not None:
+            self.set_header("Content-Type", self.content_type)
         self.finish(result)
 
 class FileRequestHandler(AuthorizedFileHandler):
@@ -720,7 +766,7 @@ class FileRequestHandler(AuthorizedFileHandler):
             f"filename*=UTF-8\'\'{utf8_basename}")
 
     async def delete(self, path: str) -> None:
-        path = self.request.path.lstrip("/").split("/", 2)[-1]
+        path = self.endpoint.lstrip("/").split("/", 2)[-1]
         path = url_unescape(path, plus=False)
         file_manager: FileManager
         file_manager = self.server.lookup_component('file_manager')
@@ -728,7 +774,8 @@ class FileRequestHandler(AuthorizedFileHandler):
             filename = await file_manager.delete_file(path)
         except self.server.error as e:
             raise tornado.web.HTTPError(e.status_code, str(e))
-        self.finish({'result': filename})
+        self.set_header("Content-Type", "application/json; charset=UTF-8")
+        self.finish(jsonw.dumps({'result': filename}))
 
     async def get(self, path: str, include_body: bool = True) -> None:
         # Set up our path instance variables.
@@ -878,10 +925,16 @@ class FileUploadHandler(AuthorizedRequestHandler):
         self.file_manager: FileManager = self.server.lookup_component(
             'file_manager')
         self.max_upload_size = max_upload_size
+        self.parse_lock = Lock()
+        self.parse_failed: bool = False
 
     def prepare(self) -> None:
         super(FileUploadHandler, self).prepare()
-        logging.info(f"Upload Request Received from {self.request.remote_ip}")
+        content_type: str = self.request.headers.get("Content-Type", "")
+        logging.info(
+            f"Upload Request Received from {self.request.remote_ip}\n"
+            f"Content-Type: {content_type}"
+        )
         fm: FileManager = self.server.lookup_component("file_manager")
         fm.check_write_enabled()
         if self.request.method == "POST":
@@ -903,11 +956,23 @@ class FileUploadHandler(AuthorizedRequestHandler):
                 self._parser.register(name, target)
 
     async def data_received(self, chunk: bytes) -> None:
-        if self.request.method == "POST":
-            evt_loop = self.server.get_event_loop()
-            await evt_loop.run_in_thread(self._parser.data_received, chunk)
+        if self.request.method == "POST" and not self.parse_failed:
+            async with self.parse_lock:
+                evt_loop = self.server.get_event_loop()
+                try:
+                    await evt_loop.run_in_thread(self._parser.data_received, chunk)
+                except ParseFailedException:
+                    logging.exception("Chunk Parsing Error")
+                    self.parse_failed = True
 
     async def post(self) -> None:
+        if self.parse_failed:
+            self._file.on_finish()
+            try:
+                os.remove(self._file.filename)
+            except Exception:
+                pass
+            raise tornado.web.HTTPError(500, "File Upload Parsing Failed")
         form_args = {}
         chk_target = self._targets.pop('checksum')
         calc_chksum = self._sha256_target.value.lower()
@@ -920,9 +985,11 @@ class FileUploadHandler(AuthorizedRequestHandler):
                     os.remove(self._file.filename)
                 except Exception:
                     pass
-                raise self.server.error(
+                raise tornado.web.HTTPError(
+                    422,
                     f"File checksum mismatch: expected {recd_cksum}, "
-                    f"calculated {calc_chksum}", 422)
+                    f"calculated {calc_chksum}"
+                )
         for name, target in self._targets.items():
             if target.value:
                 form_args[name] = target.value.decode()
@@ -958,7 +1025,8 @@ class FileUploadHandler(AuthorizedRequestHandler):
             self.set_header("Location", location)
             logging.debug(f"Upload Location header set: {location}")
         self.set_status(201)
-        self.finish(result)
+        self.set_header("Content-Type", "application/json; charset=UTF-8")
+        self.finish(jsonw.dumps(result))
 
 # Default Handler for unregistered endpoints
 class AuthorizedErrorHandler(AuthorizedRequestHandler):
@@ -975,15 +1043,16 @@ class AuthorizedErrorHandler(AuthorizedRequestHandler):
         if 'exc_info' in kwargs:
             err['traceback'] = "\n".join(
                 traceback.format_exception(*kwargs['exc_info']))
-        self.finish({'error': err})
+        self.set_header("Content-Type", "application/json; charset=UTF-8")
+        self.finish(jsonw.dumps({'error': err}))
 
 class RedirectHandler(AuthorizedRequestHandler):
     def get(self, *args, **kwargs) -> None:
         url: Optional[str] = self.get_argument('url', None)
         if url is None:
             try:
-                body_args: Dict[str, Any] = json.loads(self.request.body)
-            except json.JSONDecodeError:
+                body_args: Dict[str, Any] = jsonw.loads(self.request.body)
+            except jsonw.JSONDecodeError:
                 body_args = {}
             if 'url' not in body_args:
                 raise tornado.web.HTTPError(
@@ -1006,7 +1075,7 @@ class WelcomeHandler(tornado.web.RequestHandler):
         auth: AuthComp = self.server.lookup_component("authorization", None)
         if auth is not None:
             try:
-                user = auth.check_authorized(self.request)
+                auth.check_authorized(self.request)
             except tornado.web.HTTPError:
                 authorized = False
             else:
