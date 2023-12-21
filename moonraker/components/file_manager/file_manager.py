@@ -104,6 +104,7 @@ class FileManager:
         self.scheduled_notifications: Dict[str, asyncio.TimerHandle] = {}
         self.fixed_path_args: Dict[str, Any] = {}
         self.queue_gcodes: bool = config.getboolean('queue_gcode_uploads', False)
+        self.check_klipper_path = config.getboolean("check_klipper_config_path", True)
 
         # Register file management endpoints
         self.server.register_endpoint(
@@ -195,24 +196,25 @@ class FileManager:
                 "klippy.log", log_path, force=True)
 
         # Validate config file
-        cfg_file: Optional[str] = paths.get("config_file")
-        cfg_parent = self.file_paths.get("config")
-        if cfg_file is not None and cfg_parent is not None:
-            cfg_path = pathlib.Path(cfg_file).expanduser()
-            par_path = pathlib.Path(cfg_parent)
-            if (
-                par_path in cfg_path.parents or
-                par_path.resolve() in cfg_path.resolve().parents
-            ):
-                self.server.remove_warning("klipper_config")
-            else:
-                self.server.add_warning(
-                    "file_manager: Klipper configuration file not located in "
-                    "'config' folder.\n\n"
-                    f"Klipper Config Path: {cfg_path}\n\n"
-                    f"Config Folder: {par_path}",
-                    warn_id="klipper_config"
-                )
+        if self.check_klipper_path:
+            cfg_file: Optional[str] = paths.get("config_file")
+            cfg_parent = self.file_paths.get("config")
+            if cfg_file is not None and cfg_parent is not None:
+                cfg_path = pathlib.Path(cfg_file).expanduser()
+                par_path = pathlib.Path(cfg_parent)
+                if (
+                    par_path in cfg_path.parents or
+                    par_path.resolve() in cfg_path.resolve().parents
+                ):
+                    self.server.remove_warning("klipper_config")
+                else:
+                    self.server.add_warning(
+                        "file_manager: Klipper configuration file not located in "
+                        "'config' folder.\n\n"
+                        f"Klipper Config Path: {cfg_path}\n\n"
+                        f"Config Folder: {par_path}",
+                        warn_id="klipper_config"
+                    )
 
     def validate_gcode_path(self, gc_path: str) -> None:
         gc_dir = pathlib.Path(gc_path).expanduser()
@@ -268,15 +270,29 @@ class FileManager:
                 f"Supplied path ({path}) for ({root}) is invalid. Make sure\n"
                 "that the path exists and is not the file system root.")
             return False
-        permissions = os.R_OK
+        # Check Folder Permissions
+        missing_perms = []
+        try:
+            # Test read
+            os.listdir(path)
+        except PermissionError:
+            missing_perms.append("READ")
+        except Exception:
+            logging.exception(f"Error testing read access for root {root}")
         if full_access:
-            permissions |= os.W_OK
+            if (
+                os.access in os.supports_effective_ids and
+                not os.access(path, os.W_OK, effective_ids=True)
+            ):
+                missing_perms.append("WRITE")
             self.full_access_roots.add(root)
-        if not os.access(path, permissions):
-            self.server.add_warning(
-                f"Moonraker does not have permission to access path "
-                f"({path}) for ({root}).")
-            return False
+        if missing_perms:
+            mpstr = " | ".join(missing_perms)
+            self.server.add_log_rollover_item(
+                f"fm_reg_perms_{root}",
+                f"file_manager: Moonraker has detected the following missing "
+                f"permissions for root folder '{root}': {mpstr}"
+            )
         if path != self.file_paths.get(root, ""):
             self.file_paths[root] = path
             self.server.register_static_file_handler(root, path)
@@ -834,8 +850,14 @@ class FileManager:
         if unzip_ufp:
             filename = os.path.splitext(filename)[0] + ".gcode"
             dest_path = os.path.splitext(dest_path)[0] + ".gcode"
-        if os.path.isfile(dest_path) and not os.access(dest_path, os.W_OK):
-            raise self.server.error(f"File is read-only: {dest_path}")
+        if (
+            os.path.isfile(dest_path) and
+            os.access in os.supports_effective_ids and
+            not os.access(dest_path, os.W_OK, effective_ids=True)
+        ):
+            logging.info(
+                f"Destination file exists and appears to be read-only: {dest_path}"
+            )
         return {
             'root': root,
             'filename': filename,
@@ -1811,17 +1833,41 @@ class InotifyObserver(BaseFileSystemObserver):
         try:
             root_node = InotifyRootNode(self, root, root_path)
         except Exception:
+            logging.exception(f"Inotify: failed to create root node '{root}'")
+            self.server.add_warning(
+                f"file_manager: Failed to create inotify root node {root}. "
+                "See moonraker.log for details.",
+                log=False
+            )
             return
         self.watched_roots[root] = root_node
         if self.initialized:
-            mevts = root_node.scan_node()
+            try:
+                mevts = root_node.scan_node()
+            except Exception:
+                logging.exception(f"Inotify: failed to scan root '{root}'")
+                self.server.add_warning(
+                    f"file_manager: Failed to scan inotify root node '{root}'. "
+                    "See moonraker.log for details.",
+                    log=False
+                )
+                return
             self.log_nodes()
             self.event_loop.register_callback(
                 self._notify_root_updated, mevts, root, root_path)
 
     def initialize(self) -> None:
         for root, node in self.watched_roots.items():
-            evts = node.scan_node()
+            try:
+                evts = node.scan_node()
+            except Exception:
+                logging.exception(f"Inotify: failed to scan root '{root}'")
+                self.server.add_warning(
+                    f"file_manager: Failed to scan inotify root node '{root}'. "
+                    "See moonraker.log for details.",
+                    log=False
+                )
+                continue
             if not evts:
                 continue
             root_path = node.get_path()
