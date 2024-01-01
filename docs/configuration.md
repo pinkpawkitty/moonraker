@@ -355,14 +355,18 @@ location: printer
 #   A description of the webcam location, ie: what the webcam is observing.
 #   The default is "printer".
 icon:
-#   A name of the icon to use for the camera.  The default is mdiWebcam.
+#   A name of the icon to use for the camera.  See the tip following this
+#   example for known values.  The default is mdiWebcam.
 enabled: True
 #   An optional boolean value to indicate if this webcam should be enabled.
 #   Default is True.
 service: mjpegstreamer
 #   The name of the application or service hosting the webcam stream.  Front-
-#   ends may use this configuration to determine how to launch or start the
-#   program.  The default is "mjpegstreamer".
+#   ends may use this configuration to determine how to connect to the service
+#   and interpret its stream.  See the tip following this example for
+#   currently known values.  The default is "mjpegstreamer".
+location: printer
+#   A string describing the location of the camera.  Default is printer.
 target_fps: 15
 #   An integer value specifying the target framerate.  The default is 15 fps.
 target_fps_idle: 5
@@ -390,6 +394,41 @@ aspect_ratio: 4:3
 #   is specific to certain services, otherwise it is ignored.
 #   The default is 4:3.
 ```
+
+!!! Tip
+    The following are known `icon` values:
+
+    | Icon Description | [webcam] icon value | Supported Frontends |
+    | ---------------- | --------------------| -------- |
+    | Printer | `mdiPrinter3d` | Mainsail |
+    | Nozzle | `mdiPrinter3dNozzle` | Mainsail |
+    | Bed | `mdiRadiatorDisabled` | Mainsail |
+    | Webcam | `mdiWebcam` | Mainsail |
+    | Filament | `mdiAlbum` | Mainsail |
+    | Door | `mdiDoor` | Mainsail |
+    | MCU | `mdiRaspberryPi` | Mainsail |
+    | Hot | `mdiCampfire` | Mainsail |
+
+    The documentation for
+    [Mainsail](https://docs.mainsail.xyz/overview/settings/webcams#service)
+    and [Fluidd](https://docs.fluidd.xyz/features/cameras)
+    contain descriptions for their respective streaming service options.
+    Below is a table of values mapping currently known service types to
+    the values accepted by the webcam's `service` option:
+
+    | Service Type | [webcam] service value | Supported Frontends |
+    | ------------- | --------------------- | ------------------- |
+    | MJPEG-Streamer | `mjpegstreamer` | Mainsail, Fluidd |
+    | Adaptive MJPEG-Streamer | `mjpegstreamer-adaptive` | Mainsail, Fluidd |
+    | UV4L-MJPEG | `uv4l-mjpeg` |  Mainsail |
+    | IP-Camera | `ipstream` | Mainsail, Fluidd |
+    | WebRTC (camera-streamer) | `webrtc-camerastreamer` | Mainsail, Fluidd |
+    | WebRTC (go2rtc) | `webrtc-go2rtc` | Mainsail, Fluidd |
+    | WebRTC (MediaMTX) | `webrtc-mediamtx` | Mainsail |
+    | WebRTC (Janus) | `webrtc-janus` | Mainsail |
+    | HLS Streamer | `hlsstream` | Mainsail, Fluidd |
+    | jMuxer | `jmuxer-stream` | Mainsail |
+    | HTTP Page | `iframe`| Fluidd |
 
 ## Optional Components
 
@@ -936,6 +975,9 @@ password: mypassword
 
 The following options are available for `shelly` device types:
 
+!!! Note
+    Currently only Gen 1 Shelly devices support Authentication
+
 ```ini
 # moonraker.conf
 
@@ -1266,6 +1308,10 @@ The following options are available for `hue` device types:
 address:
 #   A valid ip address or hostname of the Philips Hue Bridge. This
 #   parameter must be provided.
+port:
+#   A port number if an alternative Zigbee bridge is used on a HTTP port 
+#   different from the default 80/443
+#   
 user:
 #   The api key used for request authorization.  This option accepts
 #   Jinja2 Templates, see the [secrets] section for details.
@@ -2288,10 +2334,13 @@ pin: gpiochip0/gpio26
 #      ^!gpiochip0/gpio26
 #      ~!gpiochip0/gpio26
 #   This parameter must be provided
-minimum_event_time: .05
-#   The minimum time (in seconds) between events to trigger a response.  This is
-#   is used to debounce buttons.  This value must be at least .01 seconds.
-#   The default is .05 seconds (50 milliseconds).
+debounce_period: .05
+#   The time (in seconds) an event is delayed to debounce the response.
+#   The minimum debounce period is .01 seconds.  The default is .05 seconds.
+minimum_event_time: 0
+#   The minimum event duration (in seconds) required to trigger a response.
+#   This can be used as a secondary debounce procedure. The default is 0
+#   seconds (no minumum duration).
 on_press:
 on_release:
 #   Jinja2 templates to be executed when a button event is detected.  At least one

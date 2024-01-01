@@ -17,6 +17,7 @@ from .git_deploy import GitDeploy
 from .zip_deploy import ZipDeploy
 from .system_deploy import PackageDeploy
 from .web_deploy import WebClientDeploy
+from ...common import RequestType
 
 # Annotation imports
 from typing import (
@@ -139,32 +140,32 @@ class UpdateManager:
                 self._handle_auto_refresh)
 
         self.server.register_endpoint(
-            "/machine/update/moonraker", ["POST"],
-            self._handle_update_request)
+            "/machine/update/moonraker", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/klipper", ["POST"],
-            self._handle_update_request)
+            "/machine/update/klipper", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/system", ["POST"],
-            self._handle_update_request)
+            "/machine/update/system", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/client", ["POST"],
-            self._handle_update_request)
+            "/machine/update/client", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/full", ["POST"],
-            self._handle_full_update_request)
+            "/machine/update/full", RequestType.POST, self._handle_full_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/status", ["GET"],
-            self._handle_status_request)
+            "/machine/update/status", RequestType.GET, self._handle_status_request
+        )
         self.server.register_endpoint(
-            "/machine/update/refresh", ["POST"],
-            self._handle_refresh_request)
+            "/machine/update/refresh", RequestType.POST, self._handle_refresh_request
+        )
         self.server.register_endpoint(
-            "/machine/update/recover", ["POST"],
-            self._handle_repo_recovery)
+            "/machine/update/recover", RequestType.POST, self._handle_repo_recovery
+        )
         self.server.register_endpoint(
-            "/machine/update/rollback", ["POST"],
-            self._handle_rollback)
+            "/machine/update/rollback", RequestType.POST, self._handle_rollback
+        )
         self.server.register_notification("update_manager:update_response")
         self.server.register_notification("update_manager:update_refreshed")
 
@@ -590,10 +591,14 @@ class CommandHelper:
         retries: int = 1,
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
-        sig_idx: int = 1
+        sig_idx: int = 1,
+        log_stderr: bool = False
     ) -> None:
         cb = self.notify_update_response if notify else None
-        scmd = self.build_shell_command(cmd, callback=cb, env=env, cwd=cwd)
+        log_stderr |= self.server.is_verbose_enabled()
+        scmd = self.build_shell_command(
+            cmd, callback=cb, env=env, cwd=cwd, log_stderr=log_stderr
+        )
         for _ in range(retries):
             if await scmd.run(timeout=timeout, sig_idx=sig_idx):
                 break
