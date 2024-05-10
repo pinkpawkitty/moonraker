@@ -33,6 +33,13 @@ The format is based on [Keep a Changelog].
 - **update_manager**: Added support for "zipped" application updates
 - **file_manager**: Added `enable_config_write_access` option
 - **machine**: Add support for system peripheral queries
+- **mqtt**:  Added the `status_interval` option to support rate limiting
+- **mqtt**:  Added the `enable_tls` option to support ssl/tls connections
+- **history**: Added `user` field to job history data
+- **history**: Added support for auxiliary history fields
+- **spoolman**:  Report spool ids set during a print in history auxiliary data
+- **sensor**: Added support for history fields reported in auxiliary data
+- **power**:  Added support for `uhubctl` devices
 
 ### Fixed
 
@@ -49,6 +56,8 @@ The format is based on [Keep a Changelog].
   skipped subscription updates.
 - **configheler**: Fixed inline comment parsing.
 - **authorization**: Fixed blocking call to `socket.getfqdn()`
+- **power**: Fixed "on_when_job_queued" behavior when the internal device
+  state is stale.
 
 ### Changed
 
@@ -59,7 +68,7 @@ The format is based on [Keep a Changelog].
 - **build**: Bumped zeroconf to version `0.131.0`
 - **build**: Bumped libnacl to version `2.1.0`
 - **build**: Bumped distro to version `1.9.0`
-- **build**: Bumped pillow to version `10.2.0`
+- **build**: Bumped pillow to version `10.3.0`
 - **build**: Bumped streaming-form-data to version `1.13.0`
 - **machine**: Added `ratos-configurator` to list of default allowed services
 - **update_manager**:  It is now required that an application be "allowed"
